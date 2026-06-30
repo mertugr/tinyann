@@ -15,7 +15,8 @@ Small **C++17** in-memory vector similarity search library with a CLI.
 - Edge cases: empty index, `k == 0`, `k > n`, zero vectors (cosine → score `0`)
 - CLI to load vectors from a text file and run queries (`--index exact|hnsw`, optional `--recall`)
 - **Binary persistence**: `Index::save` / `Index::load` and `HnswIndex::save` / `HnswIndex::load` (HNSW stores the full graph); CLI `--save` / `--load`
-- Unit tests (CTest), including random-data recall@10 checks and save/load byte-identical search
+- **`remove(id)` / `update(id, vector)` / `contains(id)`** on both indexes; HNSW hard-deletes unlink nodes, remap indices, and reassign the entry point so the graph stays searchable
+- Unit tests (CTest), including random-data recall@10 checks, save/load byte-identical search, and remove/update
 
 ## Why HNSW (not IVF)?
 
@@ -70,6 +71,12 @@ auto exact2 = tinyann::Index::load("exact.tann");
 hnsw.save("hnsw.tann");
 auto hnsw2 = tinyann::HnswIndex::load("hnsw.tann");
 // search results on loaded indexes are byte-identical to pre-save
+
+// Remove / update (all entries with that id)
+exact.remove(42);
+exact.update(7, new_vector);
+hnsw.remove(42);   // unlinks node, keeps graph searchable; reassigns entry if needed
+hnsw.update(7, new_vector);
 ```
 
 Header-only: link the `tinyann` CMake interface target (or add `include/`).

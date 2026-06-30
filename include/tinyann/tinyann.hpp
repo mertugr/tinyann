@@ -311,6 +311,56 @@ public:
         data_.insert(data_.end(), vector.begin(), vector.end());
     }
 
+    /// Remove every entry with the given id.
+    /// @return true if at least one vector was removed.
+    bool remove(std::int64_t id) {
+        bool removed = false;
+        for (std::size_t i = 0; i < ids_.size();) {
+            if (ids_[i] != id) {
+                ++i;
+                continue;
+            }
+            const std::size_t last = ids_.size() - 1;
+            if (i != last) {
+                ids_[i] = ids_[last];
+                std::copy(data_.begin() + static_cast<std::ptrdiff_t>(last * dimension_),
+                          data_.begin() + static_cast<std::ptrdiff_t>((last + 1) * dimension_),
+                          data_.begin() + static_cast<std::ptrdiff_t>(i * dimension_));
+            }
+            ids_.pop_back();
+            data_.resize(ids_.size() * dimension_);
+            removed = true;
+            // re-check index i (now holds former last, or we shrunk past it)
+        }
+        return removed;
+    }
+
+    /// Replace the vector for every entry with the given id (in place).
+    /// @return true if at least one entry was updated.
+    /// @throws std::invalid_argument on dimension mismatch
+    bool update(std::int64_t id, const std::vector<float>& vector) {
+        if (vector.size() != dimension_) {
+            throw std::invalid_argument(
+                "tinyann::Index::update: vector dimension mismatch (expected " +
+                std::to_string(dimension_) + ", got " + std::to_string(vector.size()) + ")");
+        }
+        bool updated = false;
+        for (std::size_t i = 0; i < ids_.size(); ++i) {
+            if (ids_[i] != id) {
+                continue;
+            }
+            std::copy(vector.begin(), vector.end(),
+                      data_.begin() + static_cast<std::ptrdiff_t>(i * dimension_));
+            updated = true;
+        }
+        return updated;
+    }
+
+    /// True if at least one entry has this id.
+    bool contains(std::int64_t id) const {
+        return std::find(ids_.begin(), ids_.end(), id) != ids_.end();
+    }
+
     /// Exact k-NN search. Best-first; empty if k==0 or index empty; all if k>n.
     std::vector<SearchResult> search(const std::vector<float>& query, std::size_t k) const {
         if (query.size() != dimension_) {
@@ -506,6 +556,49 @@ public:
         }
     }
 
+    /// Remove every node with the given id. Unlinks the node from the HNSW graph,
+    /// swap-removes storage, and remaps neighbor indices so the graph stays
+    /// searchable. If the entry point is removed, reassigns it to a remaining
+    /// node with maximum level (smallest index on ties).
+    /// @return true if at least one node was removed.
+    bool remove(std::int64_t id) {
+        bool removed = false;
+        for (int i = static_cast<int>(ids_.size()) - 1; i >= 0; --i) {
+            if (ids_[static_cast<std::size_t>(i)] == id) {
+                remove_node_at(i);
+                removed = true;
+            }
+        }
+        return removed;
+    }
+
+    /// Replace the vector for every node with the given id (in place; graph
+    /// topology unchanged). Search remains valid; links may be slightly
+    /// suboptimal relative to the new embedding.
+    /// @return true if at least one node was updated.
+    bool update(std::int64_t id, const std::vector<float>& vector) {
+        if (vector.size() != dimension_) {
+            throw std::invalid_argument(
+                "tinyann::HnswIndex::update: vector dimension mismatch (expected " +
+                std::to_string(dimension_) + ", got " + std::to_string(vector.size()) + ")");
+        }
+        bool updated = false;
+        for (std::size_t i = 0; i < ids_.size(); ++i) {
+            if (ids_[i] != id) {
+                continue;
+            }
+            std::copy(vector.begin(), vector.end(),
+                      data_.begin() + static_cast<std::ptrdiff_t>(i * dimension_));
+            updated = true;
+        }
+        return updated;
+    }
+
+    /// True if at least one node has this id.
+    bool contains(std::int64_t id) const {
+        return std::find(ids_.begin(), ids_.end(), id) != ids_.end();
+    }
+
     std::vector<SearchResult> search(const std::vector<float>& query, std::size_t k) const {
         return search(query, k, params_.ef_search);
     }
@@ -677,6 +770,92 @@ private:
         }
         if (params.ef_construction == 0 || params.ef_search == 0) {
             throw std::invalid_argument("tinyann::HnswIndex: ef_construction/ef_search must be > 0");
+        }
+    }
+
+    /// Hard-delete node at index `idx`, keep graph consistent and searchable.
+    void remove_node_at(int idx) {
+        const int n = static_cast<int>(ids_.size());
+        if (idx < 0 || idx >= n) {
+            return;
+        }
+        const int last = n - 1;
+        const bool removed_entry = (entry_point_ == idx);
+
+        // Drop all edges pointing at idx (and clear idx's own lists).
+        for (int i = 0; i < n; ++i) {
+            for (auto& links : neighbors_[static_cast<std::size_t>(i)]) {
+                links.erase(std::remove(links.begin(), links.end(), idx), links.end());
+            }
+        }
+
+        if (idx != last) {
+            // Swap-remove: move last node into the freed slot.
+            ids_[static_cast<std::size_t>(idx)] = ids_[static_cast<std::size_t>(last)];
+            std::copy(data_.begin() + static_cast<std::ptrdiff_t>(last * static_cast<int>(dimension_)),
+                      data_.begin() + static_cast<std::ptrdiff_t>((last + 1) * static_cast<int>(dimension_)),
+                      data_.begin() + static_cast<std::ptrdiff_t>(idx * static_cast<int>(dimension_)));
+            levels_[static_cast<std::size_t>(idx)] = levels_[static_cast<std::size_t>(last)];
+            neighbors_[static_cast<std::size_t>(idx)] =
+                std::move(neighbors_[static_cast<std::size_t>(last)]);
+
+            // Remap any neighbor index that still points at `last` -> `idx`.
+            // Only nodes 0..last-1 remain meaningful; neighbors_[idx] is the moved last.
+            for (int i = 0; i < last; ++i) {
+                for (auto& links : neighbors_[static_cast<std::size_t>(i)]) {
+                    for (int& nb : links) {
+                        if (nb == last) {
+                            nb = idx;
+                        }
+                    }
+                }
+            }
+            if (entry_point_ == last) {
+                entry_point_ = idx;
+            }
+        }
+
+        ids_.pop_back();
+        data_.resize(ids_.size() * dimension_);
+        levels_.pop_back();
+        neighbors_.pop_back();
+
+        if (ids_.empty()) {
+            entry_point_ = -1;
+            max_level_ = -1;
+            return;
+        }
+
+        if (removed_entry) {
+            reassign_entry_point();
+        } else {
+            // Entry may no longer sit at the global max level after removals.
+            recompute_max_level();
+            if (entry_point_ < 0 || entry_point_ >= static_cast<int>(ids_.size()) ||
+                levels_[static_cast<std::size_t>(entry_point_)] < max_level_) {
+                reassign_entry_point();
+            }
+        }
+    }
+
+    /// Choose entry point as a remaining node with maximum level (min index on ties).
+    void reassign_entry_point() {
+        entry_point_ = 0;
+        max_level_ = levels_[0];
+        for (std::size_t i = 1; i < levels_.size(); ++i) {
+            if (levels_[i] > max_level_) {
+                max_level_ = levels_[i];
+                entry_point_ = static_cast<int>(i);
+            }
+        }
+    }
+
+    void recompute_max_level() {
+        max_level_ = levels_.empty() ? -1 : levels_[0];
+        for (std::size_t i = 1; i < levels_.size(); ++i) {
+            if (levels_[i] > max_level_) {
+                max_level_ = levels_[i];
+            }
         }
     }
 

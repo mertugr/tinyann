@@ -565,6 +565,215 @@ void test_persistence_all_metrics() {
     }
 }
 
+bool results_contain_id(const std::vector<tinyann::SearchResult>& r, std::int64_t id) {
+    for (const auto& hit : r) {
+        if (hit.id == id) {
+            return true;
+        }
+    }
+    return false;
+}
+
+void test_exact_remove_update() {
+    tinyann::Index idx(2, tinyann::Metric::InnerProduct);
+    idx.add(1, {1.f, 0.f});
+    idx.add(2, {0.f, 1.f});
+    idx.add(3, {0.5f, 0.f});
+    CHECK(idx.size() == 3);
+    CHECK(idx.contains(2));
+    CHECK(!idx.remove(99));
+    CHECK(idx.remove(2));
+    CHECK(!idx.contains(2));
+    CHECK(idx.size() == 2);
+    auto r = idx.search({0.f, 1.f}, 10);
+    CHECK(!results_contain_id(r, 2));
+    CHECK(results_contain_id(r, 1) || results_contain_id(r, 3));
+
+    // Update remaining id=1
+    CHECK(idx.update(1, {0.f, 2.f}));
+    CHECK(!idx.update(2, {1.f, 0.f}));  // gone
+    auto r2 = idx.search({0.f, 1.f}, 1);
+    CHECK(r2.size() == 1);
+    CHECK(r2[0].id == 1);
+    CHECK_NEAR(r2[0].score, 2.0, 1e-5);
+
+    // Remove all
+    CHECK(idx.remove(1));
+    CHECK(idx.remove(3));
+    CHECK(idx.empty());
+    CHECK(idx.search({1.f, 0.f}, 5).empty());
+
+    // Duplicate ids: remove clears all
+    idx.add(7, {1.f, 0.f});
+    idx.add(7, {2.f, 0.f});
+    CHECK(idx.size() == 2);
+    CHECK(idx.remove(7));
+    CHECK(idx.empty());
+}
+
+void test_hnsw_remove_update() {
+    tinyann::HnswParams p;
+    p.M = 8;
+    p.ef_construction = 64;
+    p.ef_search = 32;
+    p.seed = 5;
+    tinyann::HnswIndex h(2, tinyann::Metric::InnerProduct, p);
+    h.add(1, {1.f, 0.f});
+    h.add(2, {0.f, 1.f});
+    h.add(3, {0.5f, 0.f});
+    h.add(4, {-1.f, 0.f});
+    CHECK(h.size() == 4);
+    CHECK(h.contains(3));
+    CHECK(!h.remove(99));
+    CHECK(h.remove(3));
+    CHECK(!h.contains(3));
+    CHECK(h.size() == 3);
+
+    auto r = h.search({1.f, 0.f}, 10);
+    CHECK(r.size() == 3);
+    CHECK(!results_contain_id(r, 3));
+
+    CHECK(h.update(1, {0.f, 3.f}));
+    CHECK(!h.update(3, {1.f, 0.f}));
+    auto r2 = h.search({0.f, 1.f}, 1);
+    CHECK(r2.size() == 1);
+    CHECK(r2[0].id == 1);
+    CHECK_NEAR(r2[0].score, 3.0, 1e-5);
+}
+
+void test_hnsw_remove_entry_point() {
+    // Deterministic seed; delete every id and ensure we never crash and
+    // entry/search stay valid when non-empty.
+    tinyann::HnswParams p;
+    p.M = 6;
+    p.ef_construction = 50;
+    p.ef_search = 20;
+    p.seed = 11;
+    tinyann::HnswIndex h(4, tinyann::Metric::Cosine, p);
+    std::mt19937_64 rng(88);
+    const std::size_t n = 40;
+    for (std::size_t i = 0; i < n; ++i) {
+        h.add(static_cast<std::int64_t>(i), random_unit_vector(4, rng));
+    }
+    // Delete in an order that will hit the entry point eventually / repeatedly.
+    for (std::size_t i = 0; i < n; ++i) {
+        const std::int64_t id = static_cast<std::int64_t>((i * 7) % n);
+        if (!h.contains(id)) {
+            continue;
+        }
+        CHECK(h.remove(id));
+        CHECK(!h.contains(id));
+        if (!h.empty()) {
+            auto hits = h.search(random_unit_vector(4, rng), std::min<std::size_t>(5, h.size()));
+            CHECK(!hits.empty());
+            CHECK(hits.size() <= h.size());
+            for (const auto& hit : hits) {
+                CHECK(hit.id != id);
+                CHECK(h.contains(hit.id));
+            }
+        } else {
+            CHECK(h.search({1.f, 0.f, 0.f, 0.f}, 3).empty());
+        }
+    }
+    CHECK(h.empty());
+}
+
+void test_hnsw_remove_keeps_searchable() {
+    tinyann::HnswParams p;
+    p.M = 16;
+    p.ef_construction = 100;
+    p.ef_search = 50;
+    p.seed = 123;
+    const std::size_t dim = 16;
+    const std::size_t n = 300;
+    tinyann::HnswIndex h(dim, tinyann::Metric::Euclidean, p);
+    tinyann::Index exact(dim, tinyann::Metric::Euclidean);
+    std::mt19937_64 rng(55);
+    for (std::size_t i = 0; i < n; ++i) {
+        auto v = random_unit_vector(dim, rng);
+        // Scale for L2 variety
+        for (float& x : v) {
+            x *= 2.f;
+        }
+        h.add(static_cast<std::int64_t>(i), v);
+        exact.add(static_cast<std::int64_t>(i), v);
+    }
+
+    // Remove a chunk of ids including low and high indices
+    for (std::int64_t id = 0; id < 50; ++id) {
+        CHECK(h.remove(id));
+        CHECK(exact.remove(id));
+    }
+    for (std::int64_t id = 250; id < 300; ++id) {
+        CHECK(h.remove(id));
+        CHECK(exact.remove(id));
+    }
+    CHECK(h.size() == 200);
+    CHECK(exact.size() == 200);
+
+    std::vector<std::vector<float>> queries;
+    for (int i = 0; i < 20; ++i) {
+        auto q = random_unit_vector(dim, rng);
+        for (float& x : q) {
+            x *= 2.f;
+        }
+        queries.push_back(q);
+    }
+
+    // No removed id appears
+    for (const auto& q : queries) {
+        auto hits = h.search(q, 10);
+        CHECK(hits.size() == 10);
+        for (const auto& hit : hits) {
+            CHECK(hit.id >= 50);
+            CHECK(hit.id < 250);
+            CHECK(h.contains(hit.id));
+        }
+    }
+
+    // Still reasonable recall after deletions
+    const double rec = h.recall_at_k_vs(exact, queries, 10, 50);
+    std::cout << "recall@10[after_remove]=" << rec << "\n";
+    CHECK(rec > 0.85);
+}
+
+void test_remove_update_persist_roundtrip() {
+    tinyann::Index exact(2, tinyann::Metric::Cosine);
+    exact.add(1, {1.f, 0.f});
+    exact.add(2, {0.f, 1.f});
+    exact.add(3, {1.f, 1.f});
+    exact.remove(2);
+    exact.update(3, {0.f, 1.f});
+    const std::string pe = temp_path("tinyann_rm_exact.bin");
+    exact.save(pe);
+    auto el = tinyann::Index::load(pe);
+    CHECK(el.size() == 2);
+    CHECK(!el.contains(2));
+    CHECK(el.contains(1));
+    CHECK(el.contains(3));
+    const auto q = std::vector<float>{0.f, 1.f};
+    CHECK(results_byte_identical(exact.search(q, 2), el.search(q, 2)));
+
+    tinyann::HnswParams p;
+    p.M = 8;
+    p.ef_construction = 40;
+    p.ef_search = 20;
+    p.seed = 9;
+    tinyann::HnswIndex h(2, tinyann::Metric::Cosine, p);
+    h.add(1, {1.f, 0.f});
+    h.add(2, {0.f, 1.f});
+    h.add(3, {1.f, 1.f});
+    h.add(4, {-1.f, 0.f});
+    h.remove(2);
+    h.update(1, {0.9f, 0.1f});
+    const std::string ph = temp_path("tinyann_rm_hnsw.bin");
+    h.save(ph);
+    auto hl = tinyann::HnswIndex::load(ph);
+    CHECK(hl.size() == 3);
+    CHECK(!hl.contains(2));
+    CHECK(results_byte_identical(h.search(q, 3), hl.search(q, 3)));
+}
+
 }  // namespace
 
 int main() {
@@ -600,6 +809,11 @@ int main() {
     test_hnsw_save_load_identical_search();
     test_hnsw_load_rejects_exact_file();
     test_persistence_all_metrics();
+    test_exact_remove_update();
+    test_hnsw_remove_update();
+    test_hnsw_remove_entry_point();
+    test_hnsw_remove_keeps_searchable();
+    test_remove_update_persist_roundtrip();
 
     std::cout << "passed=" << g_passed << " failed=" << g_failed << "\n";
     return g_failed == 0 ? 0 : 1;
