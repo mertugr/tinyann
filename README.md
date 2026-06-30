@@ -9,10 +9,23 @@ Small **C++17** in-memory vector similarity search library with a CLI.
   - **cosine** — similarity (higher is better)
   - **inner_product** (ip / dot) — similarity (higher is better)
   - **euclidean** (l2) — distance (lower is better)
-- Exact brute-force **k-NN** (`search(query, k)`)
+- **Exact** brute-force k-NN (`Index`)
+- **Approximate** k-NN via **HNSW** (`HnswIndex`) — same metrics, tunable speed/recall
+- **`recall_at_k` / `HnswIndex::recall_at_k_vs`** to measure approx quality vs exact
 - Edge cases: empty index, `k == 0`, `k > n`, zero vectors (cosine → score `0`)
-- CLI to load vectors from a text file and run queries
-- Unit tests (CTest)
+- CLI to load vectors from a text file and run queries (`--index exact|hnsw`, optional `--recall`)
+- Unit tests (CTest), including random-data recall@10 checks
+
+## Why HNSW (not IVF)?
+
+| | **HNSW** (chosen) | **IVF** |
+|--|-------------------|---------|
+| Insert API | Incremental `add()` — no training pass | Needs k-means training / retrain on growth |
+| In-memory k-NN | Excellent recall vs latency | Needs high `nprobe` for high recall; often paired with PQ |
+| Query tuning | `ef_search` at query time | `nprobe` only searches more clusters |
+| Fit for tinyann | Matches “add then search” library shape | Better when you batch-build huge static corpora |
+
+HNSW trades a modest amount of RAM (graph links) and build time for high recall without a separate clustering stage — the usual default for process-local ANN.
 
 ## Build
 
@@ -32,50 +45,51 @@ Artifacts:
 ```cpp
 #include "tinyann/tinyann.hpp"
 
-tinyann::Index index(/*dim=*/3, tinyann::Metric::Cosine);
-index.add(1, {1.f, 0.f, 0.f});
-index.add(2, {0.f, 1.f, 0.f});
+// Exact
+tinyann::Index exact(/*dim=*/32, tinyann::Metric::Cosine);
+exact.add(1, /* vector */);
 
-auto hits = index.search({1.f, 0.f, 0.f}, /*k=*/2);
-// hits[i].id, hits[i].score — best first
+// Approximate (HNSW)
+tinyann::HnswParams p;
+p.M = 16;
+p.ef_construction = 200;
+p.ef_search = 64;
+tinyann::HnswIndex hnsw(32, tinyann::Metric::Cosine, p);
+hnsw.add(1, /* vector */);
+
+auto hits = hnsw.search(query, /*k=*/10);
+
+// Measure quality vs exact on a query set
+double rec = hnsw.recall_at_k_vs(exact, queries, /*k=*/10);
+// or: tinyann::recall_at_k(approx_hits, exact_hits);
 ```
 
-Header-only: link against the `tinyann` CMake interface target (or add `include/` to your include path).
+Header-only: link the `tinyann` CMake interface target (or add `include/`).
 
 ## CLI
 
-Vector file format — one vector per line:
-
-```text
-<id> <f1> <f2> ... <fN>
-```
-
-Lines starting with `#` and blank lines are ignored. If the leading id is omitted, sequential ids starting at `0` are assigned.
-
-Query file — one query per line, either `f1 … fN` or `id f1 … fN` (id ignored).
-
 ```bash
-./build/tinyann \
-  --dim 3 \
-  --metric cosine \
-  --vectors data/vectors.txt \
-  --query data/query.txt \
-  --k 3
+# Exact
+./build/tinyann --dim 3 --metric cosine \
+  --vectors data/vectors.txt --query data/query.txt --k 3 --index exact
+
+# HNSW + print mean recall@k against exact on the same queries
+./build/tinyann --dim 3 --metric cosine \
+  --vectors data/vectors.txt --query data/query.txt --k 3 \
+  --index hnsw --ef 64 --M 16 --recall
 ```
 
-Output: `rank<TAB>id<TAB>score` per hit.
-
-Metrics accepted by `--metric`: `cosine`, `cos`, `euclidean`, `l2`, `inner_product`, `ip`, `dot`.
+Vector file: `<id> <f1> … <fN>` per line (`#` comments / blanks ignored).
 
 ## Ranking rules
 
-| Metric         | Score meaning              | Order        |
-|----------------|----------------------------|--------------|
-| Cosine         | similarity in `[-1, 1]`    | descending   |
-| Inner product  | dot product                | descending   |
-| Euclidean (L2) | distance ≥ 0               | ascending    |
+| Metric         | Score meaning           | Order      |
+|----------------|-------------------------|------------|
+| Cosine         | similarity in `[-1, 1]` | descending |
+| Inner product  | dot product             | descending |
+| Euclidean (L2) | distance ≥ 0            | ascending  |
 
-Equal scores are tie-broken by smaller `id` first (deterministic).
+Equal scores tie-break by smaller `id`.
 
 ## License
 
