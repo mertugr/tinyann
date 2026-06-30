@@ -972,6 +972,83 @@ void test_ivf_save_load() {
     CHECK(results_byte_identical(before, loaded.search(q, 5)));
 }
 
+void test_sq_quantize_dequantize() {
+    const std::vector<float> v = {0.f, 1.f, -1.f, 0.5f, -0.25f, 127.f, -64.f};
+    std::vector<std::int8_t> codes;
+    float scale = 0.f;
+    tinyann::sq::quantize(v, codes, scale);
+    CHECK(codes.size() == v.size());
+    CHECK(scale > 0.f);
+    auto recon = tinyann::sq::dequantize(codes, scale);
+    CHECK(recon.size() == v.size());
+    for (std::size_t i = 0; i < v.size(); ++i) {
+        // Symmetric int8 should reconstruct within about one quantum.
+        CHECK_NEAR(recon[i], v[i], scale * 0.51 + 1e-5);
+    }
+    // Zero vector
+    std::vector<float> z(8, 0.f);
+    float zs = 0.f;
+    std::vector<std::int8_t> zc;
+    tinyann::sq::quantize(z, zc, zs);
+    CHECK_NEAR(zs, 1.0, 1e-6);
+    for (auto c : zc) {
+        CHECK(c == 0);
+    }
+}
+
+void test_index_sq_search_and_recall() {
+    tinyann::IndexSq sq(2, tinyann::Metric::InnerProduct);
+    tinyann::Index exact(2, tinyann::Metric::InnerProduct);
+    sq.add(1, {1.f, 0.f});
+    sq.add(2, {0.f, 1.f});
+    sq.add(3, {0.5f, 0.f});
+    exact.add(1, {1.f, 0.f});
+    exact.add(2, {0.f, 1.f});
+    exact.add(3, {0.5f, 0.f});
+    auto r = sq.search({1.f, 0.f}, 2);
+    CHECK(r.size() == 2);
+    CHECK(r[0].id == 1);
+
+    // Larger random set: high recall vs float exact (quantization noise)
+    const std::size_t dim = 32;
+    const std::size_t n = 500;
+    const std::size_t nq = 30;
+    tinyann::IndexSq sq2(dim, tinyann::Metric::Cosine);
+    tinyann::Index ex2(dim, tinyann::Metric::Cosine);
+    std::mt19937_64 rng(55);
+    for (std::size_t i = 0; i < n; ++i) {
+        auto v = random_unit_vector(dim, rng);
+        sq2.add(static_cast<std::int64_t>(i), v);
+        ex2.add(static_cast<std::int64_t>(i), v);
+    }
+    std::vector<std::vector<float>> queries;
+    for (std::size_t i = 0; i < nq; ++i) {
+        queries.push_back(random_unit_vector(dim, rng));
+    }
+    const double rec = sq2.recall_at_k_vs(ex2, queries, 10);
+    std::cout << "recall@10[sq_int8]=" << rec << "\n";
+    CHECK(rec > 0.95);
+
+    CHECK(sq2.remove(0));
+    CHECK(!sq2.contains(0));
+}
+
+void test_index_sq_save_load() {
+    tinyann::IndexSq sq(3, tinyann::Metric::Euclidean);
+    sq.add(10, {1.f, 2.f, 3.f});
+    sq.add(20, {0.f, -1.f, 0.5f});
+    const auto q = std::vector<float>{1.f, 0.f, 0.f};
+    const auto before = sq.search(q, 2);
+    const std::string path = temp_path("tinyann_sq.bin");
+    sq.save(path);
+    auto loaded = tinyann::IndexSq::load(path);
+    CHECK(loaded.size() == 2);
+    CHECK(results_byte_identical(before, loaded.search(q, 2)));
+    // Reconstruct roughly matches original
+    auto rec = loaded.reconstruct(0);
+    CHECK_NEAR(rec[0], 1.f, 0.05);
+}
+
 void test_ivf_remove_update() {
     tinyann::IvfParams p;
     p.nlist = 4;
@@ -1123,6 +1200,9 @@ int main() {
     test_ivf_recall();
     test_ivf_save_load();
     test_ivf_remove_update();
+    test_sq_quantize_dequantize();
+    test_index_sq_search_and_recall();
+    test_index_sq_save_load();
 
     std::cout << "passed=" << g_passed << " failed=" << g_failed << "\n";
     return g_failed == 0 ? 0 : 1;

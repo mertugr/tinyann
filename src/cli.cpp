@@ -32,6 +32,8 @@ void print_usage(const char* argv0) {
         << "  --query FILE      Query vector file (optional if only --save)\n"
         << "  --k K             Number of nearest neighbors (default: 10)\n"
         << "  --index TYPE      exact | brute | hnsw | approx | ivf  (default: exact)\n"
+        << "  --sq              Store exact index vectors as int8 scalar-quantized codes\n"
+        << "                    (only with --index exact; uses IndexSq)\n"
         << "  --ef N            HNSW ef_search candidate list size (default: 64)\n"
         << "  --M N             HNSW M (max links per layer; default: 16)\n"
         << "  --efc N           HNSW ef_construction (default: 200)\n"
@@ -67,6 +69,7 @@ struct Options {
     std::string load_path;
     std::string allow_ids_path;
     bool measure_recall = false;
+    bool use_sq = false;
     bool bench = false;
     std::size_t n = 20000;
     std::size_t nq = 200;
@@ -148,6 +151,8 @@ bool parse_args(int argc, char** argv, Options& opt) {
             opt.allow_ids_path = v;
         } else if (arg == "--recall") {
             opt.measure_recall = true;
+        } else if (arg == "--sq") {
+            opt.use_sq = true;
         } else if (arg == "--bench") {
             opt.bench = true;
         } else if (arg == "--n") {
@@ -543,6 +548,65 @@ int main(int argc, char** argv) {
                       << opt.allow_ids_path << "\n";
         }
         auto pred = [&](std::int64_t id) { return !filtered || allow_ids.count(id) > 0; };
+
+        if (opt.use_sq && !use_exact(opt.index_type)) {
+            std::cerr << "--sq currently applies only to --index exact (flat SQ index)\n";
+            return 2;
+        }
+
+        if (use_exact(opt.index_type) && opt.use_sq) {
+            tinyann::IndexSq index(1, opt.metric);
+            if (loading) {
+                index = tinyann::IndexSq::load(opt.load_path);
+                std::cerr << "loaded sq index from " << opt.load_path << "\n";
+            } else {
+                index = tinyann::IndexSq(opt.dim, opt.metric);
+                LoadedData data;
+                if (!load_vectors_file(opt.vectors_path, opt.dim, data)) {
+                    return 1;
+                }
+                for (std::size_t i = 0; i < data.ids.size(); ++i) {
+                    index.add(data.ids[i], data.vectors[i]);
+                }
+            }
+            if (!opt.save_path.empty()) {
+                index.save(opt.save_path);
+                std::cerr << "saved sq index to " << opt.save_path << "\n";
+            }
+            std::cerr << "index=sq(int8) size=" << index.size() << " dim=" << index.dimension()
+                      << " metric=" << tinyann::metric_name(index.metric()) << " k=" << opt.k
+                      << (filtered ? " filtered=1" : "") << "\n";
+            if (!opt.query_path.empty()) {
+                std::vector<std::vector<float>> queries;
+                if (!load_queries(opt.query_path, index.dimension(), queries)) {
+                    return 1;
+                }
+                tinyann::Index exact_for_recall(index.dimension(), index.metric());
+                if (opt.measure_recall && !loading) {
+                    LoadedData data;
+                    if (load_vectors_file(opt.vectors_path, opt.dim, data)) {
+                        for (std::size_t i = 0; i < data.ids.size(); ++i) {
+                            exact_for_recall.add(data.ids[i], data.vectors[i]);
+                        }
+                    }
+                }
+                for (std::size_t qi = 0; qi < queries.size(); ++qi) {
+                    if (queries.size() > 1) {
+                        std::cout << "# query " << qi << "\n";
+                    }
+                    if (filtered) {
+                        print_hits(index.search(queries[qi], opt.k, pred));
+                    } else {
+                        print_hits(index.search(queries[qi], opt.k));
+                    }
+                }
+                if (opt.measure_recall && exact_for_recall.size() > 0) {
+                    const double rec = index.recall_at_k_vs(exact_for_recall, queries, opt.k);
+                    std::cerr << "recall@" << opt.k << "=" << rec << " (sq vs float exact)\n";
+                }
+            }
+            return 0;
+        }
 
         if (use_ivf(opt.index_type)) {
             tinyann::IvfIndex ivf(1, opt.metric);

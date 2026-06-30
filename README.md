@@ -13,6 +13,7 @@ Distance kernels use **SIMD** when available (AVX2 / SSE2 / ARM NEON, with scala
 - **Exact** brute-force k-NN (`Index`)
 - **Approximate** k-NN via **HNSW** (`HnswIndex`) — same metrics, tunable speed/recall
 - **Approximate** k-NN via **IVF** (`IvfIndex`) — FAISS-style: train k-means (`nlist`), probe `nprobe` lists, brute-force within
+- **Scalar quantization (SQ int8)** — `tinyann::sq::quantize` / `dequantize`, `IndexSq` stores per-vector int8 codes + scale; CLI `--sq`
 - **`recall_at_k` / `HnswIndex::recall_at_k_vs`** to measure approx quality vs exact
 - Edge cases: empty index, `k == 0`, `k > n`, zero vectors (cosine → score `0`)
 - CLI to load vectors from a text file and run queries (`--index exact|hnsw`, optional `--recall`)
@@ -88,6 +89,16 @@ hnsw.update(7, new_vector);
 auto hits = index.search(query, 10, [](std::int64_t id) { return id % 2 == 0; });
 auto ahits = hnsw.search(query, 10, /*ef=*/64, [](std::int64_t id) { return id > 0; });
 
+// Scalar quantization (int8, symmetric per-vector scale)
+std::vector<std::int8_t> codes;
+float scale = 0.f;
+tinyann::sq::quantize(vec, codes, scale);
+auto approx = tinyann::sq::dequantize(codes, scale);
+
+tinyann::IndexSq sq_index(dim, tinyann::Metric::Cosine);
+sq_index.add(1, vec);
+auto shits = sq_index.search(query, 10);
+
 // IVF (train then add — FAISS-like)
 tinyann::IvfParams ip;
 ip.nlist = 100;
@@ -126,6 +137,10 @@ Header-only: link the `tinyann` CMake interface target (or add `include/`).
 # Filtered search: only ids listed in allow file (one int64 per line)
 ./build/tinyann --dim 3 --metric cosine --vectors data/vectors.txt \
   --query data/query.txt --k 3 --index hnsw --allow-ids data/allow_ids.txt --recall
+
+# Exact with int8 scalar quantization
+./build/tinyann --dim 3 --metric cosine --vectors data/vectors.txt \
+  --query data/query.txt --k 3 --index exact --sq --recall
 
 # IVF
 ./build/tinyann --dim 3 --metric cosine --vectors data/vectors.txt \

@@ -457,6 +457,7 @@ constexpr std::uint32_t kFormatVersion = 1;
 constexpr std::uint32_t kKindExact = 1;
 constexpr std::uint32_t kKindHnsw = 2;
 constexpr std::uint32_t kKindIvf = 3;
+constexpr std::uint32_t kKindSq = 4;  // exact index with int8 scalar quantization
 
 inline void write_bytes(std::ostream& out, const void* data, std::size_t n) {
     out.write(reinterpret_cast<const char*>(data), static_cast<std::streamsize>(n));
@@ -1871,6 +1872,265 @@ private:
     std::vector<std::int64_t> ids_;
     std::vector<float> data_;
     std::vector<std::size_t> list_of_;  // node -> list id
+};
+
+// ---------------------------------------------------------------------------
+// Scalar quantization (SQ, int8) — FAISS-style symmetric per-vector scales
+// x_i ≈ scale * code_i,  code_i ∈ [-127, 127]
+// ---------------------------------------------------------------------------
+
+namespace sq {
+
+/// Symmetric int8 encode: scale = max|x| / 127 (scale=1 if vector is zero).
+inline void quantize(const float* v, std::size_t dim, std::int8_t* codes, float& scale_out) {
+    float max_abs = 0.f;
+    for (std::size_t i = 0; i < dim; ++i) {
+        const float a = std::fabs(v[i]);
+        if (a > max_abs) {
+            max_abs = a;
+        }
+    }
+    if (max_abs == 0.f) {
+        scale_out = 1.f;
+        std::fill(codes, codes + dim, static_cast<std::int8_t>(0));
+        return;
+    }
+    scale_out = max_abs / 127.f;
+    const float inv = 1.f / scale_out;
+    for (std::size_t i = 0; i < dim; ++i) {
+        const float q = std::round(v[i] * inv);
+        const int qi = static_cast<int>(q);
+        const int clamped = std::max(-127, std::min(127, qi));
+        codes[i] = static_cast<std::int8_t>(clamped);
+    }
+}
+
+/// Decode: out_i = scale * code_i
+inline void dequantize(const std::int8_t* codes, float scale, std::size_t dim, float* out) {
+    for (std::size_t i = 0; i < dim; ++i) {
+        out[i] = scale * static_cast<float>(codes[i]);
+    }
+}
+
+/// Convenience: quantize into vectors.
+inline void quantize(const std::vector<float>& v, std::vector<std::int8_t>& codes, float& scale) {
+    codes.resize(v.size());
+    quantize(v.data(), v.size(), codes.data(), scale);
+}
+
+inline std::vector<float> dequantize(const std::vector<std::int8_t>& codes, float scale) {
+    std::vector<float> out(codes.size());
+    dequantize(codes.data(), scale, codes.size(), out.data());
+    return out;
+}
+
+}  // namespace sq
+
+/// Exact k-NN over **int8 scalar-quantized** vectors (per-vector symmetric scale).
+/// Distances use dequantized floats and the same metrics as `Index`.
+class IndexSq {
+public:
+    explicit IndexSq(std::size_t dimension, Metric metric = Metric::Cosine)
+        : dimension_(dimension), metric_(metric) {
+        if (dimension_ == 0) {
+            throw std::invalid_argument("tinyann::IndexSq: dimension must be > 0");
+        }
+    }
+
+    std::size_t dimension() const noexcept { return dimension_; }
+    Metric metric() const noexcept { return metric_; }
+    std::size_t size() const noexcept { return ids_.size(); }
+    bool empty() const noexcept { return ids_.empty(); }
+
+    /// Quantize and store (int8 codes + scale).
+    void add(std::int64_t id, const std::vector<float>& vector) {
+        if (vector.size() != dimension_) {
+            throw std::invalid_argument(
+                "tinyann::IndexSq::add: vector dimension mismatch (expected " +
+                std::to_string(dimension_) + ", got " + std::to_string(vector.size()) + ")");
+        }
+        float scale = 1.f;
+        const std::size_t off = codes_.size();
+        codes_.resize(off + dimension_);
+        sq::quantize(vector.data(), dimension_, codes_.data() + off, scale);
+        scales_.push_back(scale);
+        ids_.push_back(id);
+    }
+
+    bool remove(std::int64_t id) {
+        bool removed = false;
+        for (std::size_t i = 0; i < ids_.size();) {
+            if (ids_[i] != id) {
+                ++i;
+                continue;
+            }
+            const std::size_t last = ids_.size() - 1;
+            if (i != last) {
+                ids_[i] = ids_[last];
+                scales_[i] = scales_[last];
+                std::copy(codes_.begin() + static_cast<std::ptrdiff_t>(last * dimension_),
+                          codes_.begin() + static_cast<std::ptrdiff_t>((last + 1) * dimension_),
+                          codes_.begin() + static_cast<std::ptrdiff_t>(i * dimension_));
+            }
+            ids_.pop_back();
+            scales_.pop_back();
+            codes_.resize(ids_.size() * dimension_);
+            removed = true;
+        }
+        return removed;
+    }
+
+    bool update(std::int64_t id, const std::vector<float>& vector) {
+        if (vector.size() != dimension_) {
+            throw std::invalid_argument(
+                "tinyann::IndexSq::update: vector dimension mismatch (expected " +
+                std::to_string(dimension_) + ", got " + std::to_string(vector.size()) + ")");
+        }
+        bool updated = false;
+        for (std::size_t i = 0; i < ids_.size(); ++i) {
+            if (ids_[i] != id) {
+                continue;
+            }
+            float scale = 1.f;
+            sq::quantize(vector.data(), dimension_,
+                         codes_.data() + i * dimension_, scale);
+            scales_[i] = scale;
+            updated = true;
+        }
+        return updated;
+    }
+
+    bool contains(std::int64_t id) const {
+        return std::find(ids_.begin(), ids_.end(), id) != ids_.end();
+    }
+
+    /// Dequantize vector `i` into `out` (size == dimension()).
+    void reconstruct(std::size_t i, float* out) const {
+        if (i >= ids_.size()) {
+            throw std::out_of_range("tinyann::IndexSq::reconstruct");
+        }
+        sq::dequantize(codes_.data() + i * dimension_, scales_[i], dimension_, out);
+    }
+
+    std::vector<float> reconstruct(std::size_t i) const {
+        std::vector<float> out(dimension_);
+        reconstruct(i, out.data());
+        return out;
+    }
+
+    std::vector<SearchResult> search(const std::vector<float>& query, std::size_t k) const {
+        return search(query, k, [](std::int64_t) { return true; });
+    }
+
+    template <typename Pred>
+    auto search(const std::vector<float>& query, std::size_t k, Pred predicate) const
+        -> std::enable_if_t<std::is_invocable_r<bool, Pred&, std::int64_t>::value,
+                            std::vector<SearchResult>> {
+        if (query.size() != dimension_) {
+            throw std::invalid_argument(
+                "tinyann::IndexSq::search: query dimension mismatch (expected " +
+                std::to_string(dimension_) + ", got " + std::to_string(query.size()) + ")");
+        }
+        if (k == 0 || empty()) {
+            return {};
+        }
+
+        std::vector<float> recon(dimension_);
+        std::vector<SearchResult> eligible;
+        eligible.reserve(std::min(k, size()));
+        for (std::size_t i = 0; i < ids_.size(); ++i) {
+            if (!predicate(ids_[i])) {
+                continue;
+            }
+            sq::dequantize(codes_.data() + i * dimension_, scales_[i], dimension_, recon.data());
+            eligible.push_back(SearchResult{
+                ids_[i], metric_score(metric_, query.data(), recon.data(), dimension_)});
+        }
+        if (eligible.empty()) {
+            return {};
+        }
+
+        const std::size_t take = std::min(k, eligible.size());
+        const bool hib = higher_is_better(metric_);
+        auto better = [hib](const SearchResult& a, const SearchResult& b) {
+            if (a.score != b.score) {
+                return hib ? (a.score > b.score) : (a.score < b.score);
+            }
+            return a.id < b.id;
+        };
+        if (take < eligible.size()) {
+            std::partial_sort(eligible.begin(),
+                              eligible.begin() + static_cast<std::ptrdiff_t>(take), eligible.end(),
+                              better);
+            eligible.resize(take);
+        } else {
+            std::sort(eligible.begin(), eligible.end(), better);
+        }
+        return eligible;
+    }
+
+    double recall_at_k_vs(const Index& exact, const std::vector<std::vector<float>>& queries,
+                          std::size_t k) const {
+        if (queries.empty()) {
+            return 1.0;
+        }
+        double sum = 0.0;
+        for (const auto& q : queries) {
+            sum += tinyann::recall_at_k(search(q, k), exact.search(q, k));
+        }
+        return sum / static_cast<double>(queries.size());
+    }
+
+    void save(const std::string& path) const {
+        std::ofstream out(path, std::ios::binary | std::ios::trunc);
+        if (!out) {
+            throw std::runtime_error("tinyann::IndexSq::save: cannot open " + path);
+        }
+        detail::write_header(out, detail::kKindSq);
+        detail::write_pod(out, static_cast<std::uint32_t>(metric_));
+        detail::write_pod(out, static_cast<std::uint64_t>(dimension_));
+        detail::write_pod(out, static_cast<std::uint64_t>(ids_.size()));
+        if (!ids_.empty()) {
+            detail::write_bytes(out, ids_.data(), ids_.size() * sizeof(std::int64_t));
+            detail::write_bytes(out, scales_.data(), scales_.size() * sizeof(float));
+            detail::write_bytes(out, codes_.data(), codes_.size() * sizeof(std::int8_t));
+        }
+    }
+
+    static IndexSq load(const std::string& path) {
+        std::ifstream in(path, std::ios::binary);
+        if (!in) {
+            throw std::runtime_error("tinyann::IndexSq::load: cannot open " + path);
+        }
+        detail::read_header(in, detail::kKindSq);
+        const Metric metric = detail::metric_from_u32(detail::read_pod<std::uint32_t>(in));
+        const std::size_t dimension = static_cast<std::size_t>(detail::read_pod<std::uint64_t>(in));
+        const std::size_t count = static_cast<std::size_t>(detail::read_pod<std::uint64_t>(in));
+        if (dimension == 0) {
+            throw std::runtime_error("tinyann::IndexSq::load: corrupt (dimension == 0)");
+        }
+        IndexSq idx(dimension, metric);
+        idx.ids_.resize(count);
+        idx.scales_.resize(count);
+        idx.codes_.resize(count * dimension);
+        if (count > 0) {
+            detail::read_bytes(in, idx.ids_.data(), count * sizeof(std::int64_t));
+            detail::read_bytes(in, idx.scales_.data(), count * sizeof(float));
+            detail::read_bytes(in, idx.codes_.data(), count * dimension * sizeof(std::int8_t));
+        }
+        return idx;
+    }
+
+    const std::vector<std::int64_t>& ids() const noexcept { return ids_; }
+    const std::vector<float>& scales() const noexcept { return scales_; }
+    const std::vector<std::int8_t>& codes() const noexcept { return codes_; }
+
+private:
+    std::size_t dimension_;
+    Metric metric_;
+    std::vector<std::int64_t> ids_;
+    std::vector<float> scales_;       // per-vector symmetric scale
+    std::vector<std::int8_t> codes_;  // row-major int8
 };
 
 }  // namespace tinyann
