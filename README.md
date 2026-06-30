@@ -14,7 +14,8 @@ Small **C++17** in-memory vector similarity search library with a CLI.
 - **`recall_at_k` / `HnswIndex::recall_at_k_vs`** to measure approx quality vs exact
 - Edge cases: empty index, `k == 0`, `k > n`, zero vectors (cosine → score `0`)
 - CLI to load vectors from a text file and run queries (`--index exact|hnsw`, optional `--recall`)
-- Unit tests (CTest), including random-data recall@10 checks
+- **Binary persistence**: `Index::save` / `Index::load` and `HnswIndex::save` / `HnswIndex::load` (HNSW stores the full graph); CLI `--save` / `--load`
+- Unit tests (CTest), including random-data recall@10 checks and save/load byte-identical search
 
 ## Why HNSW (not IVF)?
 
@@ -62,6 +63,13 @@ auto hits = hnsw.search(query, /*k=*/10);
 // Measure quality vs exact on a query set
 double rec = hnsw.recall_at_k_vs(exact, queries, /*k=*/10);
 // or: tinyann::recall_at_k(approx_hits, exact_hits);
+
+// Persistence (compact binary; HNSW includes the full graph)
+exact.save("exact.tann");
+auto exact2 = tinyann::Index::load("exact.tann");
+hnsw.save("hnsw.tann");
+auto hnsw2 = tinyann::HnswIndex::load("hnsw.tann");
+// search results on loaded indexes are byte-identical to pre-save
 ```
 
 Header-only: link the `tinyann` CMake interface target (or add `include/`).
@@ -77,9 +85,22 @@ Header-only: link the `tinyann` CMake interface target (or add `include/`).
 ./build/tinyann --dim 3 --metric cosine \
   --vectors data/vectors.txt --query data/query.txt --k 3 \
   --index hnsw --ef 64 --M 16 --recall
+
+# Save / load binary index
+./build/tinyann --dim 3 --metric cosine --vectors data/vectors.txt \
+  --index exact --save /tmp/exact.tann
+./build/tinyann --load /tmp/exact.tann --index exact \
+  --query data/query.txt --k 3
+
+./build/tinyann --dim 3 --metric cosine --vectors data/vectors.txt \
+  --index hnsw --save /tmp/hnsw.tann
+./build/tinyann --load /tmp/hnsw.tann --index hnsw \
+  --query data/query.txt --k 3
 ```
 
 Vector file: `<id> <f1> … <fN>` per line (`#` comments / blanks ignored).
+
+Binary format: magic `TANN`, version, kind (`exact` vs `hnsw`), metric, dimension, ids, vectors; HNSW also stores params, entry point, levels, adjacency lists, and RNG state.
 
 ## Ranking rules
 
