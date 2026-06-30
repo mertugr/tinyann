@@ -352,17 +352,22 @@ inline float metric_score(Metric m, const float* a, const float* b, std::size_t 
 }
 
 /// Internal "distance" for ANN graph navigation: always smaller = closer.
-/// Cosine → 1 - sim; InnerProduct → -dot; Euclidean → L2.
+/// Cosine → 1 - sim; InnerProduct → -dot; Euclidean → **squared** L2 (order-preserving, no sqrt).
 inline float ann_distance(Metric m, const float* a, const float* b, std::size_t dim) {
     switch (m) {
         case Metric::Cosine:
             return 1.f - cosine_similarity(a, b, dim);
         case Metric::Euclidean:
-            return euclidean_distance(a, b, dim);
+            return simd::squared_l2(a, b, dim);
         case Metric::InnerProduct:
             return -inner_product(a, b, dim);
     }
     return 0.f;
+}
+
+/// L2 norm of a vector (for cosine caches).
+inline float l2_norm(const float* v, std::size_t dim) {
+    return std::sqrt(inner_product(v, v, dim));
 }
 
 inline const char* metric_name(Metric m) {
@@ -784,6 +789,7 @@ public:
         const int node = static_cast<int>(ids_.size());
         ids_.push_back(id);
         data_.insert(data_.end(), vector.begin(), vector.end());
+        norms_.push_back(l2_norm(vector.data(), dimension_));
 
         const int level = random_level();
         levels_.push_back(level);
@@ -872,6 +878,7 @@ public:
             }
             std::copy(vector.begin(), vector.end(),
                       data_.begin() + static_cast<std::ptrdiff_t>(i * dimension_));
+            norms_[i] = l2_norm(vector.data(), dimension_);
             updated = true;
         }
         return updated;
@@ -920,6 +927,11 @@ public:
             throw std::invalid_argument("ef must be > 0");
         }
         ef = std::max(ef, k);
+
+        // Cache query L2 norm once for cosine navigation (avoids per-node sqrt pairs).
+        if (metric_ == Metric::Cosine) {
+            query_norm_ = l2_norm(query.data(), dimension_);
+        }
 
         int curr = entry_point_;
         for (int lc = max_level_; lc > 0; --lc) {
@@ -1049,6 +1061,7 @@ public:
         HnswIndex idx(dimension, metric, params);
         idx.ids_ = std::move(ids);
         idx.data_ = std::move(data);
+        idx.rebuild_norms();
         idx.entry_point_ = detail::read_pod<std::int32_t>(in);
         idx.max_level_ = detail::read_pod<std::int32_t>(in);
 
@@ -1120,6 +1133,7 @@ private:
             std::copy(data_.begin() + static_cast<std::ptrdiff_t>(last * static_cast<int>(dimension_)),
                       data_.begin() + static_cast<std::ptrdiff_t>((last + 1) * static_cast<int>(dimension_)),
                       data_.begin() + static_cast<std::ptrdiff_t>(idx * static_cast<int>(dimension_)));
+            norms_[static_cast<std::size_t>(idx)] = norms_[static_cast<std::size_t>(last)];
             levels_[static_cast<std::size_t>(idx)] = levels_[static_cast<std::size_t>(last)];
             neighbors_[static_cast<std::size_t>(idx)] =
                 std::move(neighbors_[static_cast<std::size_t>(last)]);
@@ -1142,6 +1156,7 @@ private:
 
         ids_.pop_back();
         data_.resize(ids_.size() * dimension_);
+        norms_.pop_back();
         levels_.pop_back();
         neighbors_.pop_back();
 
@@ -1160,6 +1175,13 @@ private:
                 levels_[static_cast<std::size_t>(entry_point_)] < max_level_) {
                 reassign_entry_point();
             }
+        }
+    }
+
+    void rebuild_norms() {
+        norms_.resize(ids_.size());
+        for (std::size_t i = 0; i < ids_.size(); ++i) {
+            norms_[i] = l2_norm(data_.data() + i * dimension_, dimension_);
         }
     }
 
@@ -1186,15 +1208,63 @@ private:
 
     using DistNode = std::pair<float, int>;
 
+    /// Order-preserving graph distance using SIMD kernels + norm caches.
     float distance_nodes(int a, int b) const {
         const float* pa = data_.data() + static_cast<std::size_t>(a) * dimension_;
         const float* pb = data_.data() + static_cast<std::size_t>(b) * dimension_;
-        return ann_distance(metric_, pa, pb, dimension_);
+        switch (metric_) {
+            case Metric::Cosine: {
+                const float na = norms_[static_cast<std::size_t>(a)];
+                const float nb = norms_[static_cast<std::size_t>(b)];
+                if (na == 0.f || nb == 0.f) {
+                    return 1.f;  // cosine → 0 ⇒ ann distance 1
+                }
+                return 1.f - inner_product(pa, pb, dimension_) / (na * nb);
+            }
+            case Metric::Euclidean:
+                return simd::squared_l2(pa, pb, dimension_);
+            case Metric::InnerProduct:
+                return -inner_product(pa, pb, dimension_);
+        }
+        return 0.f;
     }
 
     float distance_query(const float* q, int node) const {
         const float* p = data_.data() + static_cast<std::size_t>(node) * dimension_;
-        return ann_distance(metric_, q, p, dimension_);
+        switch (metric_) {
+            case Metric::Cosine: {
+                const float nb = norms_[static_cast<std::size_t>(node)];
+                if (query_norm_ == 0.f || nb == 0.f) {
+                    return 1.f;
+                }
+                return 1.f - inner_product(q, p, dimension_) / (query_norm_ * nb);
+            }
+            case Metric::Euclidean:
+                return simd::squared_l2(q, p, dimension_);
+            case Metric::InnerProduct:
+                return -inner_product(q, p, dimension_);
+        }
+        return 0.f;
+    }
+
+    void begin_visit() const {
+        if (visit_mark_.size() < ids_.size()) {
+            visit_mark_.assign(ids_.size(), 0);
+            visit_tick_ = 1;
+        }
+        ++visit_tick_;
+        if (visit_tick_ == 0) {
+            std::fill(visit_mark_.begin(), visit_mark_.end(), 0);
+            visit_tick_ = 1;
+        }
+    }
+
+    bool visited(int node) const {
+        return visit_mark_[static_cast<std::size_t>(node)] == visit_tick_;
+    }
+
+    void mark_visited(int node) const {
+        visit_mark_[static_cast<std::size_t>(node)] = visit_tick_;
     }
 
     int random_level() {
@@ -1246,6 +1316,9 @@ private:
     std::vector<DistNode> search_layer(int query_node, bool /*query_is_node*/, int enter,
                                        std::size_t ef, int layer) const {
         const float* q = data_.data() + static_cast<std::size_t>(query_node) * dimension_;
+        if (metric_ == Metric::Cosine) {
+            query_norm_ = norms_[static_cast<std::size_t>(query_node)];
+        }
         return search_layer_query_filtered(q, enter, ef, layer, [](std::int64_t) { return true; });
     }
 
@@ -1255,8 +1328,7 @@ private:
     template <typename Pred>
     std::vector<DistNode> search_layer_query_filtered(const float* q, int enter, std::size_t ef,
                                                       int layer, Pred predicate) const {
-        std::unordered_set<int> visited;
-        visited.reserve(ef * 8);
+        begin_visit();
 
         // Exploration frontier (all nodes, for connectivity).
         std::priority_queue<DistNode, std::vector<DistNode>, std::greater<DistNode>> candidates;
@@ -1265,7 +1337,7 @@ private:
 
         const float d0 = distance_query(q, enter);
         candidates.emplace(d0, enter);
-        visited.insert(enter);
+        mark_visited(enter);
         if (predicate(ids_[static_cast<std::size_t>(enter)])) {
             eligible.emplace(d0, enter);
         }
@@ -1283,9 +1355,10 @@ private:
             const auto& links =
                 neighbors_[static_cast<std::size_t>(c.second)][static_cast<std::size_t>(layer)];
             for (int nb : links) {
-                if (!visited.insert(nb).second) {
+                if (visited(nb)) {
                     continue;
                 }
+                mark_visited(nb);
                 const float d = distance_query(q, nb);
                 // Expand while eligible list is not full, or this node is closer than
                 // the worst eligible (may improve results or path through ineligible).
@@ -1330,10 +1403,16 @@ private:
 
     std::vector<std::int64_t> ids_;
     std::vector<float> data_;
+    std::vector<float> norms_;  // L2 norms per node (cosine navigation cache)
     std::vector<int> levels_;
     std::vector<std::vector<std::vector<int>>> neighbors_;
     int entry_point_ = -1;
     int max_level_ = -1;
+
+    // Search-time caches (not serialized).
+    mutable float query_norm_ = 0.f;
+    mutable std::vector<std::uint32_t> visit_mark_;
+    mutable std::uint32_t visit_tick_ = 0;
 };
 
 }  // namespace tinyann

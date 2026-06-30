@@ -116,7 +116,13 @@ Header-only: link the `tinyann` CMake interface target (or add `include/`).
 # Filtered search: only ids listed in allow file (one int64 per line)
 ./build/tinyann --dim 3 --metric cosine --vectors data/vectors.txt \
   --query data/query.txt --k 3 --index hnsw --allow-ids data/allow_ids.txt --recall
+
+# Benchmark exact vs HNSW (synthetic unit vectors)
+./build/tinyann --bench --dim 64 --n 20000 --nq 200 --k 10 \
+  --metric cosine --ef 64 --M 16 --efc 200
 ```
+
+Benchmark prints build/search times, QPS, **speedup vs exact**, **recall@k**, and checks HNSW result-id stability across two passes.
 
 Vector file: `<id> <f1> … <fN>` per line (`#` comments / blanks ignored).
 
