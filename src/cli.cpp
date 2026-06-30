@@ -20,25 +20,28 @@ void print_usage(const char* argv0) {
         << "  Build from vectors + query:\n"
         << "    " << argv0 << " --dim N --metric M --vectors FILE --query FILE [options]\n"
         << "  Load saved index + query:\n"
-        << "    " << argv0 << " --load PATH --query FILE [--index exact|hnsw] [options]\n"
+        << "    " << argv0 << " --load PATH --query FILE [--index exact|hnsw|ivf] [options]\n"
         << "  Benchmark (synthetic data):\n"
         << "    " << argv0 << " --bench --dim N [--n N] [--nq N] [--k K] [--metric M]\n"
-        << "                    [--ef N] [--M N] [--efc N] [--seed N] [--warmup N] [--runs N]\n\n"
+        << "                    [--ef N] [--M N] [--efc N] [--nlist N] [--nprobe N]\n"
+        << "                    [--seed N] [--warmup N] [--runs N]\n\n"
         << "Options:\n"
         << "  --dim N           Vector dimension (required unless --load)\n"
         << "  --metric METRIC   cosine | euclidean | l2 | inner_product | ip  (default: cosine)\n"
         << "  --vectors FILE    Text file: one vector per line: <id> <f1> <f2> ... <fN>\n"
         << "  --query FILE      Query vector file (optional if only --save)\n"
         << "  --k K             Number of nearest neighbors (default: 10)\n"
-        << "  --index TYPE      exact | brute | hnsw | approx  (default: exact)\n"
+        << "  --index TYPE      exact | brute | hnsw | approx | ivf  (default: exact)\n"
         << "  --ef N            HNSW ef_search candidate list size (default: 64)\n"
         << "  --M N             HNSW M (max links per layer; default: 16)\n"
         << "  --efc N           HNSW ef_construction (default: 200)\n"
+        << "  --nlist N         IVF number of coarse centroids / lists (default: 100)\n"
+        << "  --nprobe N        IVF lists probed at query time (default: 10)\n"
         << "  --save PATH       Write built/loaded index to PATH (binary)\n"
         << "  --load PATH       Load index from PATH instead of --vectors\n"
         << "  --allow-ids FILE  Filtered search: only ids listed in FILE (one int64 per line)\n"
         << "  --recall          Also run exact search and print mean recall@k vs exact\n"
-        << "  --bench           Run benchmark mode (exact vs HNSW latency/QPS + recall)\n"
+        << "  --bench           Run benchmark mode (exact vs HNSW vs IVF + recall)\n"
         << "  --n N             Bench: number of base vectors (default: 20000)\n"
         << "  --nq N            Bench: number of queries (default: 200)\n"
         << "  --seed N          Bench: RNG seed (default: 42)\n"
@@ -58,6 +61,8 @@ struct Options {
     std::size_t ef = 64;
     std::size_t M = 16;
     std::size_t efc = 200;
+    std::size_t nlist = 100;
+    std::size_t nprobe = 10;
     std::string save_path;
     std::string load_path;
     std::string allow_ids_path;
@@ -121,6 +126,14 @@ bool parse_args(int argc, char** argv, Options& opt) {
             const char* v = need("--efc");
             if (!v) return false;
             opt.efc = static_cast<std::size_t>(std::stoull(v));
+        } else if (arg == "--nlist") {
+            const char* v = need("--nlist");
+            if (!v) return false;
+            opt.nlist = static_cast<std::size_t>(std::stoull(v));
+        } else if (arg == "--nprobe") {
+            const char* v = need("--nprobe");
+            if (!v) return false;
+            opt.nprobe = static_cast<std::size_t>(std::stoull(v));
         } else if (arg == "--save") {
             const char* v = need("--save");
             if (!v) return false;
@@ -255,6 +268,8 @@ bool use_hnsw(const std::string& type) {
     return type == "hnsw" || type == "approx" || type == "approximate";
 }
 
+bool use_ivf(const std::string& type) { return type == "ivf"; }
+
 bool use_exact(const std::string& type) {
     return type == "exact" || type == "brute" || type == "bruteforce" || type == "bf";
 }
@@ -352,8 +367,9 @@ int run_bench(const Options& opt) {
     std::cout << "distance_backend=" << tinyann::distance_backend() << "\n";
     std::cout << "metric=" << tinyann::metric_name(opt.metric) << " dim=" << opt.dim
               << " n=" << opt.n << " nq=" << opt.nq << " k=" << opt.k << "\n";
-    std::cout << "hnsw: M=" << opt.M << " ef=" << opt.ef << " efc=" << opt.efc
-              << " seed=" << opt.seed << "\n";
+    std::cout << "hnsw: M=" << opt.M << " ef=" << opt.ef << " efc=" << opt.efc << "\n";
+    std::cout << "ivf: nlist=" << opt.nlist << " nprobe=" << opt.nprobe << " seed=" << opt.seed
+              << "\n";
 
     // Build exact
     tinyann::Index exact(opt.dim, opt.metric);
@@ -376,8 +392,22 @@ int run_bench(const Options& opt) {
         }
     });
 
+    // Build IVF (train on base, then add)
+    tinyann::IvfParams ip;
+    ip.nlist = opt.nlist;
+    ip.nprobe = opt.nprobe;
+    ip.seed = opt.seed;
+    tinyann::IvfIndex ivf(opt.dim, opt.metric, ip);
+    const double ivf_build_ms = time_ms([&] {
+        ivf.train(base);
+        for (std::size_t i = 0; i < opt.n; ++i) {
+            ivf.add(static_cast<std::int64_t>(i), base[i]);
+        }
+    });
+
     std::cout << "build_exact_ms=" << exact_build_ms << "\n";
     std::cout << "build_hnsw_ms=" << hnsw_build_ms << "\n";
+    std::cout << "build_ivf_ms=" << ivf_build_ms << "\n";
 
     auto run_exact = [&] {
         for (const auto& q : queries) {
@@ -389,62 +419,63 @@ int run_bench(const Options& opt) {
             (void)hnsw.search(q, opt.k, opt.ef);
         }
     };
+    auto run_ivf = [&] {
+        for (const auto& q : queries) {
+            (void)ivf.search(q, opt.k);
+        }
+    };
 
     for (std::size_t w = 0; w < opt.warmup; ++w) {
         run_exact();
         run_hnsw();
+        run_ivf();
     }
 
     double exact_ms_total = 0.0;
     double hnsw_ms_total = 0.0;
+    double ivf_ms_total = 0.0;
     for (std::size_t r = 0; r < opt.runs; ++r) {
         exact_ms_total += time_ms(run_exact);
         hnsw_ms_total += time_ms(run_hnsw);
+        ivf_ms_total += time_ms(run_ivf);
     }
     const double exact_ms = exact_ms_total / static_cast<double>(opt.runs);
     const double hnsw_ms = hnsw_ms_total / static_cast<double>(opt.runs);
+    const double ivf_ms = ivf_ms_total / static_cast<double>(opt.runs);
     const double exact_qps = 1000.0 * static_cast<double>(opt.nq) / exact_ms;
     const double hnsw_qps = 1000.0 * static_cast<double>(opt.nq) / hnsw_ms;
-    const double speedup = exact_ms / hnsw_ms;
+    const double ivf_qps = 1000.0 * static_cast<double>(opt.nq) / ivf_ms;
 
     std::cout << "search_exact_ms=" << exact_ms << " qps=" << exact_qps
               << " latency_us=" << (1000.0 * exact_ms / static_cast<double>(opt.nq)) << "\n";
     std::cout << "search_hnsw_ms=" << hnsw_ms << " qps=" << hnsw_qps
-              << " latency_us=" << (1000.0 * hnsw_ms / static_cast<double>(opt.nq)) << "\n";
-    std::cout << "speedup_vs_exact=" << speedup << "x\n";
+              << " latency_us=" << (1000.0 * hnsw_ms / static_cast<double>(opt.nq))
+              << " speedup_vs_exact=" << (exact_ms / hnsw_ms) << "x\n";
+    std::cout << "search_ivf_ms=" << ivf_ms << " qps=" << ivf_qps
+              << " latency_us=" << (1000.0 * ivf_ms / static_cast<double>(opt.nq))
+              << " speedup_vs_exact=" << (exact_ms / ivf_ms) << "x\n";
 
-    // Quality vs exact (ground truth)
-    const double rec = hnsw.recall_at_k_vs(exact, queries, opt.k, opt.ef);
-    std::cout << "recall@" << opt.k << "=" << rec << "\n";
+    const double rec_h = hnsw.recall_at_k_vs(exact, queries, opt.k, opt.ef);
+    const double rec_i = ivf.recall_at_k_vs(exact, queries, opt.k);
+    std::cout << "recall@" << opt.k << "_hnsw=" << rec_h << "\n";
+    std::cout << "recall@" << opt.k << "_ivf=" << rec_i << "\n";
 
-    // Stability: two HNSW passes must return the same id ranking (determinism).
-    std::size_t stable = 0;
+    std::size_t stable_h = 0, stable_i = 0;
     for (const auto& q : queries) {
-        const auto a = hnsw.search(q, opt.k, opt.ef);
-        const auto b = hnsw.search(q, opt.k, opt.ef);
-        if (same_ids(a, b)) {
-            ++stable;
+        if (same_ids(hnsw.search(q, opt.k, opt.ef), hnsw.search(q, opt.k, opt.ef))) {
+            ++stable_h;
+        }
+        if (same_ids(ivf.search(q, opt.k), ivf.search(q, opt.k))) {
+            ++stable_i;
         }
     }
-    std::cout << "hnsw_id_stable=" << stable << "/" << opt.nq
-              << (stable == opt.nq ? " OK" : " FAIL") << "\n";
+    std::cout << "hnsw_id_stable=" << stable_h << "/" << opt.nq
+              << (stable_h == opt.nq ? " OK" : " FAIL") << "\n";
+    std::cout << "ivf_id_stable=" << stable_i << "/" << opt.nq
+              << (stable_i == opt.nq ? " OK" : " FAIL") << "\n";
 
-    // Compare HNSW ids to exact: fraction of queries where top-1 id matches (sanity).
-    std::size_t top1 = 0;
-    for (const auto& q : queries) {
-        const auto e = exact.search(q, 1);
-        const auto h = hnsw.search(q, 1, opt.ef);
-        if (!e.empty() && !h.empty() && e[0].id == h[0].id) {
-            ++top1;
-        }
-    }
-    std::cout << "top1_id_match_vs_exact=" << top1 << "/" << opt.nq << "\n";
-
-    if (stable != opt.nq) {
+    if (stable_h != opt.nq || stable_i != opt.nq) {
         return 1;
-    }
-    if (rec < 0.85) {
-        std::cerr << "warning: recall below 0.85\n";
     }
     return 0;
 }
@@ -475,9 +506,9 @@ int main(int argc, char** argv) {
         return run_bench(opt);
     }
 
-    if (!use_hnsw(opt.index_type) && !use_exact(opt.index_type)) {
+    if (!use_hnsw(opt.index_type) && !use_exact(opt.index_type) && !use_ivf(opt.index_type)) {
         std::cerr << "unknown --index type: " << opt.index_type
-                  << " (use exact|brute|hnsw|approx)\n";
+                  << " (use exact|brute|hnsw|approx|ivf)\n";
         return 2;
     }
 
@@ -512,6 +543,70 @@ int main(int argc, char** argv) {
                       << opt.allow_ids_path << "\n";
         }
         auto pred = [&](std::int64_t id) { return !filtered || allow_ids.count(id) > 0; };
+
+        if (use_ivf(opt.index_type)) {
+            tinyann::IvfIndex ivf(1, opt.metric);
+            if (loading) {
+                ivf = tinyann::IvfIndex::load(opt.load_path);
+                std::cerr << "loaded ivf index from " << opt.load_path << "\n";
+                if (opt.nprobe != 10) {
+                    ivf.set_nprobe(opt.nprobe);
+                }
+            } else {
+                tinyann::IvfParams ip;
+                ip.nlist = opt.nlist;
+                ip.nprobe = opt.nprobe;
+                ivf = tinyann::IvfIndex(opt.dim, opt.metric, ip);
+                LoadedData data;
+                if (!load_vectors_file(opt.vectors_path, opt.dim, data)) {
+                    return 1;
+                }
+                ivf.train(data.vectors);
+                for (std::size_t i = 0; i < data.ids.size(); ++i) {
+                    ivf.add(data.ids[i], data.vectors[i]);
+                }
+            }
+            if (!opt.save_path.empty()) {
+                ivf.save(opt.save_path);
+                std::cerr << "saved ivf index to " << opt.save_path << "\n";
+            }
+            std::cerr << "index=ivf size=" << ivf.size() << " dim=" << ivf.dimension()
+                      << " metric=" << tinyann::metric_name(ivf.metric()) << " k=" << opt.k
+                      << " nlist=" << ivf.params().nlist << " nprobe=" << ivf.params().nprobe
+                      << (filtered ? " filtered=1" : "") << "\n";
+            if (!opt.query_path.empty()) {
+                std::vector<std::vector<float>> queries;
+                if (!load_queries(opt.query_path, ivf.dimension(), queries)) {
+                    return 1;
+                }
+                tinyann::Index exact_for_recall(ivf.dimension(), ivf.metric());
+                if (opt.measure_recall && !loading) {
+                    LoadedData data;
+                    if (load_vectors_file(opt.vectors_path, opt.dim, data)) {
+                        for (std::size_t i = 0; i < data.ids.size(); ++i) {
+                            exact_for_recall.add(data.ids[i], data.vectors[i]);
+                        }
+                    }
+                }
+                for (std::size_t qi = 0; qi < queries.size(); ++qi) {
+                    if (queries.size() > 1) {
+                        std::cout << "# query " << qi << "\n";
+                    }
+                    if (filtered) {
+                        print_hits(ivf.search(queries[qi], opt.k, pred));
+                    } else {
+                        print_hits(ivf.search(queries[qi], opt.k));
+                    }
+                }
+                if (opt.measure_recall && exact_for_recall.size() > 0) {
+                    const double rec =
+                        filtered ? ivf.recall_at_k_vs(exact_for_recall, queries, opt.k, pred)
+                                 : ivf.recall_at_k_vs(exact_for_recall, queries, opt.k);
+                    std::cerr << "recall@" << opt.k << "=" << rec << " (ivf vs exact)\n";
+                }
+            }
+            return 0;
+        }
 
         const bool approx = use_hnsw(opt.index_type);
 

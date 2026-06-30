@@ -884,6 +884,115 @@ void test_hnsw_filtered_not_postfilter_topk() {
     CHECK_NEAR(filt[0].score, 50.0, 1e-4);
 }
 
+void test_ivf_basic_and_filter() {
+    tinyann::IvfParams p;
+    p.nlist = 4;
+    p.nprobe = 4;  // probe all ⇒ exact on tiny set
+    p.kmeans_iters = 10;
+    p.seed = 1;
+    tinyann::IvfIndex ivf(2, tinyann::Metric::InnerProduct, p);
+    std::vector<std::vector<float>> train = {{1.f, 0.f}, {0.f, 1.f}, {0.5f, 0.f}, {-1.f, 0.f}};
+    ivf.train(train);
+    CHECK(ivf.trained());
+    for (std::size_t i = 0; i < train.size(); ++i) {
+        ivf.add(static_cast<std::int64_t>(i + 1), train[i]);
+    }
+    auto r = ivf.search({1.f, 0.f}, 2);
+    CHECK(r.size() == 2);
+    CHECK(r[0].id == 1);
+    CHECK_NEAR(r[0].score, 1.0, 1e-5);
+
+    auto none = ivf.search({1.f, 0.f}, 5, [](std::int64_t) { return false; });
+    CHECK(none.empty());
+    auto even = ivf.search({1.f, 0.f}, 10, [](std::int64_t id) { return id % 2 == 0; });
+    for (const auto& h : even) {
+        CHECK((h.id % 2) == 0);
+    }
+    CHECK(!even.empty());
+}
+
+void test_ivf_recall() {
+    const std::size_t dim = 32;
+    const std::size_t n = 2000;
+    const std::size_t nq = 40;
+    const std::size_t k = 10;
+    tinyann::IvfParams p;
+    p.nlist = 50;
+    p.nprobe = 20;  // 40% of lists
+    p.kmeans_iters = 20;
+    p.seed = 7;
+
+    for (auto metric : {tinyann::Metric::Cosine, tinyann::Metric::Euclidean,
+                        tinyann::Metric::InnerProduct}) {
+        tinyann::Index exact(dim, metric);
+        tinyann::IvfIndex ivf(dim, metric, p);
+        std::mt19937_64 rng(100 + static_cast<unsigned>(metric));
+        std::vector<std::vector<float>> all;
+        all.reserve(n);
+        for (std::size_t i = 0; i < n; ++i) {
+            all.push_back(random_unit_vector(dim, rng));
+        }
+        ivf.train(all);
+        for (std::size_t i = 0; i < n; ++i) {
+            exact.add(static_cast<std::int64_t>(i), all[i]);
+            ivf.add(static_cast<std::int64_t>(i), all[i]);
+        }
+        std::vector<std::vector<float>> queries;
+        for (std::size_t i = 0; i < nq; ++i) {
+            queries.push_back(random_unit_vector(dim, rng));
+        }
+        const double rec = ivf.recall_at_k_vs(exact, queries, k);
+        std::cout << "recall@10[ivf_" << tinyann::metric_name(metric) << "]=" << rec << "\n";
+        CHECK(rec > 0.85);
+    }
+}
+
+void test_ivf_save_load() {
+    tinyann::IvfParams p;
+    p.nlist = 8;
+    p.nprobe = 4;
+    p.seed = 3;
+    tinyann::IvfIndex ivf(4, tinyann::Metric::Cosine, p);
+    std::mt19937_64 rng(11);
+    std::vector<std::vector<float>> all;
+    for (int i = 0; i < 80; ++i) {
+        all.push_back(random_unit_vector(4, rng));
+    }
+    ivf.train(all);
+    for (int i = 0; i < 80; ++i) {
+        ivf.add(i, all[static_cast<std::size_t>(i)]);
+    }
+    const auto q = random_unit_vector(4, rng);
+    const auto before = ivf.search(q, 5);
+    const std::string path = temp_path("tinyann_ivf.bin");
+    ivf.save(path);
+    auto loaded = tinyann::IvfIndex::load(path);
+    CHECK(loaded.trained());
+    CHECK(loaded.size() == ivf.size());
+    CHECK(results_byte_identical(before, loaded.search(q, 5)));
+}
+
+void test_ivf_remove_update() {
+    tinyann::IvfParams p;
+    p.nlist = 4;
+    p.nprobe = 4;
+    p.seed = 2;
+    tinyann::IvfIndex ivf(2, tinyann::Metric::InnerProduct, p);
+    std::vector<std::vector<float>> t = {{1.f, 0.f}, {0.f, 1.f}, {0.5f, 0.5f}, {0.f, -1.f}};
+    ivf.train(t);
+    ivf.add(1, t[0]);
+    ivf.add(2, t[1]);
+    ivf.add(3, t[2]);
+    CHECK(ivf.remove(2));
+    CHECK(!ivf.contains(2));
+    auto r = ivf.search({0.f, 1.f}, 10);
+    CHECK(!results_contain_id(r, 2));
+    CHECK(ivf.update(1, {0.f, 2.f}));
+    auto r2 = ivf.search({0.f, 1.f}, 1);
+    CHECK(r2[0].id == 1);
+    CHECK_NEAR(r2[0].score, 2.0, 1e-5);
+}
+
 void test_hnsw_filtered_recall() {
     const std::size_t dim = 24;
     const std::size_t n = 1500;
@@ -1010,6 +1119,10 @@ int main() {
     test_hnsw_filtered_search_basic();
     test_hnsw_filtered_not_postfilter_topk();
     test_hnsw_filtered_recall();
+    test_ivf_basic_and_filter();
+    test_ivf_recall();
+    test_ivf_save_load();
+    test_ivf_remove_update();
 
     std::cout << "passed=" << g_passed << " failed=" << g_failed << "\n";
     return g_failed == 0 ? 0 : 1;

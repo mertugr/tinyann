@@ -12,6 +12,7 @@ Distance kernels use **SIMD** when available (AVX2 / SSE2 / ARM NEON, with scala
   - **euclidean** (l2) — distance (lower is better)
 - **Exact** brute-force k-NN (`Index`)
 - **Approximate** k-NN via **HNSW** (`HnswIndex`) — same metrics, tunable speed/recall
+- **Approximate** k-NN via **IVF** (`IvfIndex`) — FAISS-style: train k-means (`nlist`), probe `nprobe` lists, brute-force within
 - **`recall_at_k` / `HnswIndex::recall_at_k_vs`** to measure approx quality vs exact
 - Edge cases: empty index, `k == 0`, `k > n`, zero vectors (cosine → score `0`)
 - CLI to load vectors from a text file and run queries (`--index exact|hnsw`, optional `--recall`)
@@ -86,6 +87,15 @@ hnsw.update(7, new_vector);
 // Filtered search (eligible ids only; HNSW keeps exploring under the filter)
 auto hits = index.search(query, 10, [](std::int64_t id) { return id % 2 == 0; });
 auto ahits = hnsw.search(query, 10, /*ef=*/64, [](std::int64_t id) { return id > 0; });
+
+// IVF (train then add — FAISS-like)
+tinyann::IvfParams ip;
+ip.nlist = 100;
+ip.nprobe = 10;
+tinyann::IvfIndex ivf(dim, tinyann::Metric::Cosine, ip);
+ivf.train(training_vectors);
+ivf.add(1, vec);
+auto ihits = ivf.search(query, 10);
 ```
 
 Header-only: link the `tinyann` CMake interface target (or add `include/`).
@@ -117,12 +127,16 @@ Header-only: link the `tinyann` CMake interface target (or add `include/`).
 ./build/tinyann --dim 3 --metric cosine --vectors data/vectors.txt \
   --query data/query.txt --k 3 --index hnsw --allow-ids data/allow_ids.txt --recall
 
-# Benchmark exact vs HNSW (synthetic unit vectors)
+# IVF
+./build/tinyann --dim 3 --metric cosine --vectors data/vectors.txt \
+  --query data/query.txt --k 3 --index ivf --nlist 4 --nprobe 2 --recall
+
+# Benchmark exact vs HNSW vs IVF (synthetic unit vectors)
 ./build/tinyann --bench --dim 64 --n 20000 --nq 200 --k 10 \
-  --metric cosine --ef 64 --M 16 --efc 200
+  --metric cosine --ef 64 --M 16 --efc 200 --nlist 100 --nprobe 10
 ```
 
-Benchmark prints build/search times, QPS, **speedup vs exact**, **recall@k**, and checks HNSW result-id stability across two passes.
+Benchmark prints build/search times, QPS, **speedup vs exact**, **recall@k** for HNSW and IVF, and id stability checks.
 
 Vector file: `<id> <f1> … <fN>` per line (`#` comments / blanks ignored).
 

@@ -447,7 +447,7 @@ inline double mean_recall_at_k(
 // ---------------------------------------------------------------------------
 // Binary persistence helpers (little-endian host; fixed-width types)
 // Format: magic "TANN" | version u32 | kind u32 | ... payload ...
-// kind: 1 = Exact Index, 2 = HnswIndex
+// kind: 1 = Exact Index, 2 = HnswIndex, 3 = IvfIndex
 // ---------------------------------------------------------------------------
 
 namespace detail {
@@ -456,6 +456,7 @@ constexpr char kMagic[4] = {'T', 'A', 'N', 'N'};
 constexpr std::uint32_t kFormatVersion = 1;
 constexpr std::uint32_t kKindExact = 1;
 constexpr std::uint32_t kKindHnsw = 2;
+constexpr std::uint32_t kKindIvf = 3;
 
 inline void write_bytes(std::ostream& out, const void* data, std::size_t n) {
     out.write(reinterpret_cast<const char*>(data), static_cast<std::streamsize>(n));
@@ -1413,6 +1414,463 @@ private:
     mutable float query_norm_ = 0.f;
     mutable std::vector<std::uint32_t> visit_mark_;
     mutable std::uint32_t visit_tick_ = 0;
+};
+
+// ---------------------------------------------------------------------------
+// Approximate index: IVF (Inverted File) — FAISS-style
+//
+// 1) train(): k-means with `nlist` centroids (metric-aware assignment)
+// 2) add(): assign each vector to the nearest centroid's inverted list
+// 3) search(): probe `nprobe` closest centroids, brute-force within those lists
+// ---------------------------------------------------------------------------
+
+/// Parameters for IVF training and search.
+struct IvfParams {
+    /// Number of coarse centroids / inverted lists.
+    std::size_t nlist = 100;
+    /// Number of lists to probe at query time (1 .. nlist).
+    std::size_t nprobe = 10;
+    /// k-means iterations during train().
+    std::size_t kmeans_iters = 25;
+    /// RNG seed for centroid initialization.
+    std::uint64_t seed = 42;
+};
+
+/// In-memory IVF index (k-means coarse quantizer + exact search in probed lists).
+class IvfIndex {
+public:
+    explicit IvfIndex(std::size_t dimension, Metric metric = Metric::Cosine, IvfParams params = {})
+        : dimension_(dimension), metric_(metric), params_(params) {
+        if (dimension_ == 0) {
+            throw std::invalid_argument("tinyann::IvfIndex: dimension must be > 0");
+        }
+        if (params_.nlist == 0) {
+            throw std::invalid_argument("tinyann::IvfIndex: nlist must be > 0");
+        }
+        if (params_.nprobe == 0) {
+            throw std::invalid_argument("tinyann::IvfIndex: nprobe must be > 0");
+        }
+        if (params_.kmeans_iters == 0) {
+            throw std::invalid_argument("tinyann::IvfIndex: kmeans_iters must be > 0");
+        }
+    }
+
+    std::size_t dimension() const noexcept { return dimension_; }
+    Metric metric() const noexcept { return metric_; }
+    std::size_t size() const noexcept { return ids_.size(); }
+    bool empty() const noexcept { return ids_.empty(); }
+    bool trained() const noexcept { return trained_; }
+    const IvfParams& params() const noexcept { return params_; }
+
+    void set_nprobe(std::size_t nprobe) {
+        if (nprobe == 0) {
+            throw std::invalid_argument("nprobe must be > 0");
+        }
+        params_.nprobe = nprobe;
+    }
+
+    /// Run k-means on training vectors to learn `nlist` centroids.
+    /// Clears any previously indexed vectors. Requires non-empty training data.
+    void train(const std::vector<std::vector<float>>& training) {
+        if (training.empty()) {
+            throw std::invalid_argument("tinyann::IvfIndex::train: empty training set");
+        }
+        for (const auto& v : training) {
+            if (v.size() != dimension_) {
+                throw std::invalid_argument("tinyann::IvfIndex::train: dimension mismatch");
+            }
+        }
+
+        // Reset index contents; keep params.
+        ids_.clear();
+        data_.clear();
+        list_of_.clear();
+        lists_.assign(params_.nlist, {});
+        centroids_.assign(params_.nlist * dimension_, 0.f);
+
+        const std::size_t nt = training.size();
+        const std::size_t nlist = std::min(params_.nlist, nt);
+        // If training set smaller than nlist, shrink effective lists.
+        if (nlist < params_.nlist) {
+            params_.nlist = nlist;
+            lists_.assign(params_.nlist, {});
+            centroids_.assign(params_.nlist * dimension_, 0.f);
+        }
+        if (params_.nprobe > params_.nlist) {
+            params_.nprobe = params_.nlist;
+        }
+
+        std::mt19937_64 rng(params_.seed);
+        // Init centroids from random distinct training rows (shuffle indices).
+        std::vector<std::size_t> order(nt);
+        for (std::size_t i = 0; i < nt; ++i) {
+            order[i] = i;
+        }
+        for (std::size_t i = nt; i > 1; --i) {
+            std::uniform_int_distribution<std::size_t> dist(0, i - 1);
+            std::swap(order[i - 1], order[dist(rng)]);
+        }
+        for (std::size_t c = 0; c < params_.nlist; ++c) {
+            std::copy(training[order[c]].begin(), training[order[c]].end(),
+                      centroids_.begin() + static_cast<std::ptrdiff_t>(c * dimension_));
+            if (metric_ == Metric::Cosine) {
+                normalize_centroid(c);
+            }
+        }
+
+        std::vector<std::size_t> assign(nt, 0);
+        std::vector<std::size_t> counts(params_.nlist, 0);
+        std::vector<float> new_cent(params_.nlist * dimension_, 0.f);
+
+        for (std::size_t iter = 0; iter < params_.kmeans_iters; ++iter) {
+            // Assign
+            for (std::size_t i = 0; i < nt; ++i) {
+                assign[i] = nearest_centroid(training[i].data());
+            }
+            // Accumulate means
+            std::fill(new_cent.begin(), new_cent.end(), 0.f);
+            std::fill(counts.begin(), counts.end(), 0);
+            for (std::size_t i = 0; i < nt; ++i) {
+                const std::size_t c = assign[i];
+                ++counts[c];
+                float* dst = new_cent.data() + c * dimension_;
+                const float* src = training[i].data();
+                for (std::size_t d = 0; d < dimension_; ++d) {
+                    dst[d] += src[d];
+                }
+            }
+            // Update / re-seed empty clusters
+            for (std::size_t c = 0; c < params_.nlist; ++c) {
+                float* dst = centroids_.data() + c * dimension_;
+                if (counts[c] == 0) {
+                    std::uniform_int_distribution<std::size_t> dist(0, nt - 1);
+                    const auto& v = training[dist(rng)];
+                    std::copy(v.begin(), v.end(), dst);
+                } else {
+                    const float inv = 1.f / static_cast<float>(counts[c]);
+                    const float* src = new_cent.data() + c * dimension_;
+                    for (std::size_t d = 0; d < dimension_; ++d) {
+                        dst[d] = src[d] * inv;
+                    }
+                }
+                if (metric_ == Metric::Cosine) {
+                    normalize_centroid(c);
+                }
+            }
+        }
+
+        trained_ = true;
+    }
+
+    void add(std::int64_t id, const std::vector<float>& vector) {
+        if (!trained_) {
+            throw std::runtime_error("tinyann::IvfIndex::add: call train() first");
+        }
+        if (vector.size() != dimension_) {
+            throw std::invalid_argument(
+                "tinyann::IvfIndex::add: vector dimension mismatch (expected " +
+                std::to_string(dimension_) + ", got " + std::to_string(vector.size()) + ")");
+        }
+        const int node = static_cast<int>(ids_.size());
+        const std::size_t list = nearest_centroid(vector.data());
+        ids_.push_back(id);
+        data_.insert(data_.end(), vector.begin(), vector.end());
+        list_of_.push_back(list);
+        lists_[list].push_back(node);
+    }
+
+    bool remove(std::int64_t id) {
+        bool removed = false;
+        for (int i = static_cast<int>(ids_.size()) - 1; i >= 0; --i) {
+            if (ids_[static_cast<std::size_t>(i)] == id) {
+                remove_node_at(i);
+                removed = true;
+            }
+        }
+        return removed;
+    }
+
+    bool update(std::int64_t id, const std::vector<float>& vector) {
+        if (vector.size() != dimension_) {
+            throw std::invalid_argument(
+                "tinyann::IvfIndex::update: vector dimension mismatch (expected " +
+                std::to_string(dimension_) + ", got " + std::to_string(vector.size()) + ")");
+        }
+        bool updated = false;
+        for (std::size_t i = 0; i < ids_.size(); ++i) {
+            if (ids_[i] != id) {
+                continue;
+            }
+            // Remove from old list
+            const std::size_t old_list = list_of_[i];
+            auto& lst = lists_[old_list];
+            lst.erase(std::remove(lst.begin(), lst.end(), static_cast<int>(i)), lst.end());
+            // Replace vector
+            std::copy(vector.begin(), vector.end(),
+                      data_.begin() + static_cast<std::ptrdiff_t>(i * dimension_));
+            // Reassign list
+            const std::size_t new_list = nearest_centroid(vector.data());
+            list_of_[i] = new_list;
+            lists_[new_list].push_back(static_cast<int>(i));
+            updated = true;
+        }
+        return updated;
+    }
+
+    bool contains(std::int64_t id) const {
+        return std::find(ids_.begin(), ids_.end(), id) != ids_.end();
+    }
+
+    std::vector<SearchResult> search(const std::vector<float>& query, std::size_t k) const {
+        return search(query, k, [](std::int64_t) { return true; });
+    }
+
+    template <typename Pred>
+    auto search(const std::vector<float>& query, std::size_t k, Pred predicate) const
+        -> std::enable_if_t<std::is_invocable_r<bool, Pred&, std::int64_t>::value,
+                            std::vector<SearchResult>> {
+        if (query.size() != dimension_) {
+            throw std::invalid_argument(
+                "tinyann::IvfIndex::search: query dimension mismatch (expected " +
+                std::to_string(dimension_) + ", got " + std::to_string(query.size()) + ")");
+        }
+        if (!trained_ || k == 0 || empty()) {
+            return {};
+        }
+
+        const std::size_t nprobe = std::min(params_.nprobe, params_.nlist);
+        auto lists = probe_lists(query.data(), nprobe);
+
+        std::vector<SearchResult> eligible;
+        eligible.reserve(k * 2);
+        for (std::size_t li : lists) {
+            for (int node : lists_[li]) {
+                const std::int64_t id = ids_[static_cast<std::size_t>(node)];
+                if (!predicate(id)) {
+                    continue;
+                }
+                const float* vec = data_.data() + static_cast<std::size_t>(node) * dimension_;
+                eligible.push_back(
+                    SearchResult{id, metric_score(metric_, query.data(), vec, dimension_)});
+            }
+        }
+        if (eligible.empty()) {
+            return {};
+        }
+
+        const std::size_t take = std::min(k, eligible.size());
+        const bool hib = higher_is_better(metric_);
+        auto better = [hib](const SearchResult& a, const SearchResult& b) {
+            if (a.score != b.score) {
+                return hib ? (a.score > b.score) : (a.score < b.score);
+            }
+            return a.id < b.id;
+        };
+        if (take < eligible.size()) {
+            std::partial_sort(eligible.begin(),
+                              eligible.begin() + static_cast<std::ptrdiff_t>(take), eligible.end(),
+                              better);
+            eligible.resize(take);
+        } else {
+            std::sort(eligible.begin(), eligible.end(), better);
+        }
+        return eligible;
+    }
+
+    double recall_at_k_vs(const Index& exact, const std::vector<std::vector<float>>& queries,
+                          std::size_t k) const {
+        if (queries.empty()) {
+            return 1.0;
+        }
+        double sum = 0.0;
+        for (const auto& q : queries) {
+            sum += tinyann::recall_at_k(search(q, k), exact.search(q, k));
+        }
+        return sum / static_cast<double>(queries.size());
+    }
+
+    template <typename Pred>
+    auto recall_at_k_vs(const Index& exact, const std::vector<std::vector<float>>& queries,
+                        std::size_t k, Pred predicate) const
+        -> std::enable_if_t<std::is_invocable_r<bool, Pred&, std::int64_t>::value, double> {
+        if (queries.empty()) {
+            return 1.0;
+        }
+        double sum = 0.0;
+        for (const auto& q : queries) {
+            sum += tinyann::recall_at_k(search(q, k, predicate), exact.search(q, k, predicate));
+        }
+        return sum / static_cast<double>(queries.size());
+    }
+
+    void save(const std::string& path) const {
+        if (!trained_) {
+            throw std::runtime_error("tinyann::IvfIndex::save: not trained");
+        }
+        std::ofstream out(path, std::ios::binary | std::ios::trunc);
+        if (!out) {
+            throw std::runtime_error("tinyann::IvfIndex::save: cannot open " + path);
+        }
+        detail::write_header(out, detail::kKindIvf);
+        detail::write_ids_and_vectors(out, dimension_, metric_, ids_, data_);
+        detail::write_pod(out, static_cast<std::uint64_t>(params_.nlist));
+        detail::write_pod(out, static_cast<std::uint64_t>(params_.nprobe));
+        detail::write_pod(out, static_cast<std::uint64_t>(params_.kmeans_iters));
+        detail::write_pod(out, params_.seed);
+        detail::write_bytes(out, centroids_.data(), centroids_.size() * sizeof(float));
+        for (std::size_t i = 0; i < list_of_.size(); ++i) {
+            detail::write_pod(out, static_cast<std::uint32_t>(list_of_[i]));
+        }
+        // lists_ can be rebuilt from list_of_; still write for clarity / validation
+        for (std::size_t c = 0; c < params_.nlist; ++c) {
+            detail::write_pod(out, static_cast<std::uint32_t>(lists_[c].size()));
+            for (int node : lists_[c]) {
+                detail::write_pod(out, static_cast<std::int32_t>(node));
+            }
+        }
+    }
+
+    static IvfIndex load(const std::string& path) {
+        std::ifstream in(path, std::ios::binary);
+        if (!in) {
+            throw std::runtime_error("tinyann::IvfIndex::load: cannot open " + path);
+        }
+        detail::read_header(in, detail::kKindIvf);
+        std::size_t dimension = 0;
+        Metric metric = Metric::Cosine;
+        std::vector<std::int64_t> ids;
+        std::vector<float> data;
+        detail::read_ids_and_vectors(in, dimension, metric, ids, data);
+
+        IvfParams params;
+        params.nlist = static_cast<std::size_t>(detail::read_pod<std::uint64_t>(in));
+        params.nprobe = static_cast<std::size_t>(detail::read_pod<std::uint64_t>(in));
+        params.kmeans_iters = static_cast<std::size_t>(detail::read_pod<std::uint64_t>(in));
+        params.seed = detail::read_pod<std::uint64_t>(in);
+
+        IvfIndex idx(dimension, metric, params);
+        idx.ids_ = std::move(ids);
+        idx.data_ = std::move(data);
+        idx.centroids_.resize(params.nlist * dimension);
+        detail::read_bytes(in, idx.centroids_.data(), idx.centroids_.size() * sizeof(float));
+        idx.list_of_.resize(idx.ids_.size());
+        for (std::size_t i = 0; i < idx.list_of_.size(); ++i) {
+            idx.list_of_[i] = detail::read_pod<std::uint32_t>(in);
+        }
+        idx.lists_.assign(params.nlist, {});
+        for (std::size_t c = 0; c < params.nlist; ++c) {
+            const auto sz = detail::read_pod<std::uint32_t>(in);
+            idx.lists_[c].resize(sz);
+            for (std::uint32_t j = 0; j < sz; ++j) {
+                idx.lists_[c][j] = detail::read_pod<std::int32_t>(in);
+            }
+        }
+        idx.trained_ = true;
+        return idx;
+    }
+
+private:
+    void normalize_centroid(std::size_t c) {
+        float* p = centroids_.data() + c * dimension_;
+        const float n = l2_norm(p, dimension_);
+        if (n > 0.f) {
+            const float inv = 1.f / n;
+            for (std::size_t d = 0; d < dimension_; ++d) {
+                p[d] *= inv;
+            }
+        }
+    }
+
+    /// True if score `a` is a better assignment than `b` for the metric.
+    static bool better_score(Metric m, float a, float b) {
+        return higher_is_better(m) ? (a > b) : (a < b);
+    }
+
+    std::size_t nearest_centroid(const float* v) const {
+        std::size_t best = 0;
+        float best_s = metric_score(metric_, v, centroids_.data(), dimension_);
+        for (std::size_t c = 1; c < params_.nlist; ++c) {
+            const float s =
+                metric_score(metric_, v, centroids_.data() + c * dimension_, dimension_);
+            if (better_score(metric_, s, best_s)) {
+                best_s = s;
+                best = c;
+            }
+        }
+        return best;
+    }
+
+    std::vector<std::size_t> probe_lists(const float* q, std::size_t nprobe) const {
+        std::vector<std::pair<float, std::size_t>> scored;
+        scored.reserve(params_.nlist);
+        for (std::size_t c = 0; c < params_.nlist; ++c) {
+            const float s =
+                metric_score(metric_, q, centroids_.data() + c * dimension_, dimension_);
+            scored.emplace_back(s, c);
+        }
+        const bool hib = higher_is_better(metric_);
+        const std::size_t take = std::min(nprobe, scored.size());
+        auto better = [hib](const std::pair<float, std::size_t>& a,
+                            const std::pair<float, std::size_t>& b) {
+            if (a.first != b.first) {
+                return hib ? (a.first > b.first) : (a.first < b.first);
+            }
+            return a.second < b.second;
+        };
+        if (take < scored.size()) {
+            std::partial_sort(scored.begin(), scored.begin() + static_cast<std::ptrdiff_t>(take),
+                              scored.end(), better);
+            scored.resize(take);
+        } else {
+            std::sort(scored.begin(), scored.end(), better);
+        }
+        std::vector<std::size_t> out;
+        out.reserve(scored.size());
+        for (const auto& p : scored) {
+            out.push_back(p.second);
+        }
+        return out;
+    }
+
+    void remove_node_at(int idx) {
+        const int n = static_cast<int>(ids_.size());
+        if (idx < 0 || idx >= n) {
+            return;
+        }
+        const int last = n - 1;
+        const std::size_t list = list_of_[static_cast<std::size_t>(idx)];
+        auto& lst = lists_[list];
+        lst.erase(std::remove(lst.begin(), lst.end(), idx), lst.end());
+
+        if (idx != last) {
+            // Remove last from its list (will re-insert as idx)
+            const std::size_t last_list = list_of_[static_cast<std::size_t>(last)];
+            auto& ll = lists_[last_list];
+            ll.erase(std::remove(ll.begin(), ll.end(), last), ll.end());
+
+            ids_[static_cast<std::size_t>(idx)] = ids_[static_cast<std::size_t>(last)];
+            std::copy(data_.begin() + static_cast<std::ptrdiff_t>(last * static_cast<int>(dimension_)),
+                      data_.begin() + static_cast<std::ptrdiff_t>((last + 1) * static_cast<int>(dimension_)),
+                      data_.begin() + static_cast<std::ptrdiff_t>(idx * static_cast<int>(dimension_)));
+            list_of_[static_cast<std::size_t>(idx)] = list_of_[static_cast<std::size_t>(last)];
+            lists_[list_of_[static_cast<std::size_t>(idx)]].push_back(idx);
+        }
+
+        ids_.pop_back();
+        data_.resize(ids_.size() * dimension_);
+        list_of_.pop_back();
+    }
+
+    std::size_t dimension_;
+    Metric metric_;
+    IvfParams params_;
+    bool trained_ = false;
+
+    std::vector<float> centroids_;  // nlist * dim
+    std::vector<std::vector<int>> lists_;
+    std::vector<std::int64_t> ids_;
+    std::vector<float> data_;
+    std::vector<std::size_t> list_of_;  // node -> list id
 };
 
 }  // namespace tinyann
