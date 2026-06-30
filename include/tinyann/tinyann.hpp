@@ -5,6 +5,7 @@
 #include <cstdint>
 #include <cstring>
 #include <fstream>
+#include <functional>
 #include <limits>
 #include <queue>
 #include <random>
@@ -17,6 +18,9 @@
 #include <vector>
 
 namespace tinyann {
+
+/// Predicate for filtered search: return true if `id` is eligible.
+using IdPredicate = std::function<bool(std::int64_t)>;
 
 /// Distance / similarity metrics supported by the indexes.
 enum class Metric {
@@ -363,6 +367,16 @@ public:
 
     /// Exact k-NN search. Best-first; empty if k==0 or index empty; all if k>n.
     std::vector<SearchResult> search(const std::vector<float>& query, std::size_t k) const {
+        return search(query, k, [](std::int64_t) { return true; });
+    }
+
+    /// Exact filtered k-NN: only ids for which `predicate(id)` is true are eligible.
+    /// Returns up to k nearest eligible hits (may be fewer / empty). Ranked best-first.
+    /// A predicate that accepts everything matches unfiltered `search(query, k)`.
+    template <typename Pred>
+    auto search(const std::vector<float>& query, std::size_t k, Pred predicate) const
+        -> std::enable_if_t<std::is_invocable_r<bool, Pred&, std::int64_t>::value,
+                            std::vector<SearchResult>> {
         if (query.size() != dimension_) {
             throw std::invalid_argument(
                 "tinyann::Index::search: query dimension mismatch (expected " +
@@ -372,17 +386,21 @@ public:
             return {};
         }
 
-        const std::size_t n = size();
-        const std::size_t take = std::min(k, n);
-
-        std::vector<SearchResult> all;
-        all.reserve(n);
+        std::vector<SearchResult> eligible;
+        eligible.reserve(std::min(k, size()));
         const float* base = data_.data();
-        for (std::size_t i = 0; i < n; ++i) {
-            all.push_back(SearchResult{
+        for (std::size_t i = 0; i < ids_.size(); ++i) {
+            if (!predicate(ids_[i])) {
+                continue;
+            }
+            eligible.push_back(SearchResult{
                 ids_[i], metric_score(metric_, query.data(), base + i * dimension_, dimension_)});
         }
+        if (eligible.empty()) {
+            return {};
+        }
 
+        const std::size_t take = std::min(k, eligible.size());
         const bool hib = higher_is_better(metric_);
         auto better = [hib](const SearchResult& a, const SearchResult& b) {
             if (a.score != b.score) {
@@ -391,14 +409,15 @@ public:
             return a.id < b.id;
         };
 
-        if (take < n) {
-            std::partial_sort(all.begin(), all.begin() + static_cast<std::ptrdiff_t>(take),
-                              all.end(), better);
-            all.resize(take);
+        if (take < eligible.size()) {
+            std::partial_sort(eligible.begin(),
+                              eligible.begin() + static_cast<std::ptrdiff_t>(take), eligible.end(),
+                              better);
+            eligible.resize(take);
         } else {
-            std::sort(all.begin(), all.end(), better);
+            std::sort(eligible.begin(), eligible.end(), better);
         }
-        return all;
+        return eligible;
     }
 
     float score(const std::vector<float>& a, const std::vector<float>& b) const {
@@ -600,11 +619,31 @@ public:
     }
 
     std::vector<SearchResult> search(const std::vector<float>& query, std::size_t k) const {
-        return search(query, k, params_.ef_search);
+        return search(query, k, params_.ef_search, [](std::int64_t) { return true; });
     }
 
     std::vector<SearchResult> search(const std::vector<float>& query, std::size_t k,
                                      std::size_t ef) const {
+        return search(query, k, ef, [](std::int64_t) { return true; });
+    }
+
+    /// Filtered approximate k-NN with default `ef_search`.
+    /// `predicate(id)` selects eligible ids. Navigation still uses the full graph
+    /// (ineligible nodes can be traversed); only eligible nodes enter the result
+    /// candidate set — not a post-filter of an unfiltered top-k.
+    template <typename Pred>
+    auto search(const std::vector<float>& query, std::size_t k, Pred predicate) const
+        -> std::enable_if_t<std::is_invocable_r<bool, Pred&, std::int64_t>::value,
+                            std::vector<SearchResult>> {
+        return search(query, k, params_.ef_search, std::move(predicate));
+    }
+
+    /// Filtered approximate k-NN with explicit ef (exploration width over eligible hits).
+    template <typename Pred>
+    auto search(const std::vector<float>& query, std::size_t k, std::size_t ef,
+                Pred predicate) const
+        -> std::enable_if_t<std::is_invocable_r<bool, Pred&, std::int64_t>::value,
+                            std::vector<SearchResult>> {
         if (query.size() != dimension_) {
             throw std::invalid_argument(
                 "tinyann::HnswIndex::search: query dimension mismatch (expected " +
@@ -620,10 +659,12 @@ public:
 
         int curr = entry_point_;
         for (int lc = max_level_; lc > 0; --lc) {
+            // Upper layers: navigate on the full graph (no filter) for connectivity.
             curr = greedy_update_query(query.data(), curr, lc);
         }
 
-        auto candidates = search_layer_query(query.data(), curr, ef, /*layer=*/0);
+        auto candidates =
+            search_layer_query_filtered(query.data(), curr, ef, /*layer=*/0, predicate);
         const std::size_t take = std::min(k, candidates.size());
 
         std::vector<SearchResult> out;
@@ -651,6 +692,26 @@ public:
         for (const auto& q : queries) {
             const auto approx = search(q, k, ef);
             const auto truth = exact.search(q, k);
+            sum += tinyann::recall_at_k(approx, truth);
+        }
+        return sum / static_cast<double>(queries.size());
+    }
+
+    /// Mean recall@k of filtered HNSW search vs filtered exact search.
+    template <typename Pred>
+    auto recall_at_k_vs(const Index& exact, const std::vector<std::vector<float>>& queries,
+                        std::size_t k, Pred predicate, std::size_t ef = 0) const
+        -> std::enable_if_t<std::is_invocable_r<bool, Pred&, std::int64_t>::value, double> {
+        if (ef == 0) {
+            ef = params_.ef_search;
+        }
+        if (queries.empty()) {
+            return 1.0;
+        }
+        double sum = 0.0;
+        for (const auto& q : queries) {
+            const auto approx = search(q, k, ef, predicate);
+            const auto truth = exact.search(q, k, predicate);
             sum += tinyann::recall_at_k(approx, truth);
         }
         return sum / static_cast<double>(queries.size());
@@ -921,29 +982,40 @@ private:
     std::vector<DistNode> search_layer(int query_node, bool /*query_is_node*/, int enter,
                                        std::size_t ef, int layer) const {
         const float* q = data_.data() + static_cast<std::size_t>(query_node) * dimension_;
-        return search_layer_query(q, enter, ef, layer);
+        return search_layer_query_filtered(q, enter, ef, layer, [](std::int64_t) { return true; });
     }
 
-    std::vector<DistNode> search_layer_query(const float* q, int enter, std::size_t ef,
-                                             int layer) const {
+    /// Layer search with id filter applied to the *eligible result* set only.
+    /// Graph edges are still followed through ineligible nodes; those nodes never
+    /// enter the result heap — unlike post-filtering an unfiltered top-ef list.
+    template <typename Pred>
+    std::vector<DistNode> search_layer_query_filtered(const float* q, int enter, std::size_t ef,
+                                                      int layer, Pred predicate) const {
         std::unordered_set<int> visited;
-        visited.reserve(ef * 4);
+        visited.reserve(ef * 8);
 
+        // Exploration frontier (all nodes, for connectivity).
         std::priority_queue<DistNode, std::vector<DistNode>, std::greater<DistNode>> candidates;
-        std::priority_queue<DistNode> results;
+        // Eligible dynamic list only (max-heap, size <= ef).
+        std::priority_queue<DistNode> eligible;
 
         const float d0 = distance_query(q, enter);
         candidates.emplace(d0, enter);
-        results.emplace(d0, enter);
         visited.insert(enter);
+        if (predicate(ids_[static_cast<std::size_t>(enter)])) {
+            eligible.emplace(d0, enter);
+        }
 
         while (!candidates.empty()) {
             const DistNode c = candidates.top();
             candidates.pop();
-            const float farthest = results.top().first;
-            if (c.first > farthest) {
+
+            // Stop only when we already have `ef` eligible hits and nothing closer remains.
+            // If eligible is still short, keep exploring (important for selective filters).
+            if (eligible.size() >= ef && c.first > eligible.top().first) {
                 break;
             }
+
             const auto& links =
                 neighbors_[static_cast<std::size_t>(c.second)][static_cast<std::size_t>(layer)];
             for (int nb : links) {
@@ -951,21 +1023,25 @@ private:
                     continue;
                 }
                 const float d = distance_query(q, nb);
-                if (results.size() < ef || d < results.top().first) {
+                // Expand while eligible list is not full, or this node is closer than
+                // the worst eligible (may improve results or path through ineligible).
+                if (eligible.size() < ef || d < eligible.top().first) {
                     candidates.emplace(d, nb);
-                    results.emplace(d, nb);
-                    if (results.size() > ef) {
-                        results.pop();
+                    if (predicate(ids_[static_cast<std::size_t>(nb)])) {
+                        eligible.emplace(d, nb);
+                        if (eligible.size() > ef) {
+                            eligible.pop();
+                        }
                     }
                 }
             }
         }
 
         std::vector<DistNode> out;
-        out.reserve(results.size());
-        while (!results.empty()) {
-            out.push_back(results.top());
-            results.pop();
+        out.reserve(eligible.size());
+        while (!eligible.empty()) {
+            out.push_back(eligible.top());
+            eligible.pop();
         }
         std::sort(out.begin(), out.end(),
                   [](const DistNode& a, const DistNode& b) { return a.first < b.first; });

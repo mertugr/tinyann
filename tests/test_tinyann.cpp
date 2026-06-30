@@ -737,6 +737,138 @@ void test_hnsw_remove_keeps_searchable() {
     CHECK(rec > 0.85);
 }
 
+void test_exact_filtered_search() {
+    tinyann::Index idx(2, tinyann::Metric::InnerProduct);
+    idx.add(1, {10.f, 0.f});
+    idx.add(2, {9.f, 0.f});
+    idx.add(3, {8.f, 0.f});
+    idx.add(4, {7.f, 0.f});
+    const auto q = std::vector<float>{1.f, 0.f};
+
+    // Pass everything == unfiltered
+    auto all_pass = idx.search(q, 3, [](std::int64_t) { return true; });
+    auto unf = idx.search(q, 3);
+    CHECK(results_byte_identical(all_pass, unf));
+    CHECK(all_pass[0].id == 1);
+
+    // Only even ids
+    auto even = idx.search(q, 10, [](std::int64_t id) { return id % 2 == 0; });
+    CHECK(even.size() == 2);
+    CHECK(even[0].id == 2);
+    CHECK(even[1].id == 4);
+
+    // k larger than eligible
+    auto even_k1 = idx.search(q, 1, [](std::int64_t id) { return id % 2 == 0; });
+    CHECK(even_k1.size() == 1);
+    CHECK(even_k1[0].id == 2);
+
+    // Reject all -> empty
+    auto none = idx.search(q, 5, [](std::int64_t) { return false; });
+    CHECK(none.empty());
+
+    // k == 0
+    CHECK(idx.search(q, 0, [](std::int64_t) { return true; }).empty());
+}
+
+void test_hnsw_filtered_search_basic() {
+    tinyann::HnswParams p;
+    p.M = 8;
+    p.ef_construction = 64;
+    p.ef_search = 32;
+    p.seed = 2;
+    tinyann::HnswIndex h(2, tinyann::Metric::InnerProduct, p);
+    h.add(1, {10.f, 0.f});
+    h.add(2, {9.f, 0.f});
+    h.add(3, {8.f, 0.f});
+    h.add(4, {7.f, 0.f});
+    const auto q = std::vector<float>{1.f, 0.f};
+
+    auto all_pass = h.search(q, 3, [](std::int64_t) { return true; });
+    auto unf = h.search(q, 3);
+    CHECK(results_byte_identical(all_pass, unf));
+
+    auto even = h.search(q, 10, [](std::int64_t id) { return (id % 2) == 0; });
+    CHECK(even.size() == 2);
+    for (const auto& hit : even) {
+        CHECK((hit.id % 2) == 0);
+    }
+    CHECK(even[0].id == 2);
+    CHECK(even[1].id == 4);
+
+    CHECK(h.search(q, 5, [](std::int64_t) { return false; }).empty());
+}
+
+void test_hnsw_filtered_not_postfilter_topk() {
+    // Construct a case where the true top-k under the filter are NOT the
+    // unfiltered top-k. Post-filtering unfiltered top-1 would miss the only
+    // eligible neighbor; in-graph filtering must still find it.
+    //
+    // ids: 1 closest overall but ineligible; 2 slightly farther but eligible.
+    tinyann::HnswParams p;
+    p.M = 4;
+    p.ef_construction = 32;
+    p.ef_search = 16;
+    p.seed = 1;
+    tinyann::HnswIndex h(2, tinyann::Metric::InnerProduct, p);
+    h.add(1, {100.f, 0.f});  // best unfiltered
+    h.add(2, {50.f, 0.f});   // best eligible
+    h.add(3, {10.f, 0.f});
+    const auto q = std::vector<float>{1.f, 0.f};
+
+    auto unf = h.search(q, 1);
+    CHECK(unf.size() == 1);
+    CHECK(unf[0].id == 1);
+    // Naive post-filter of top-1 would yield empty; proper filter returns id 2.
+    auto filt = h.search(q, 1, [](std::int64_t id) { return id != 1; });
+    CHECK(filt.size() == 1);
+    CHECK(filt[0].id == 2);
+    CHECK_NEAR(filt[0].score, 50.0, 1e-4);
+}
+
+void test_hnsw_filtered_recall() {
+    const std::size_t dim = 24;
+    const std::size_t n = 1500;
+    const std::size_t nq = 40;
+    const std::size_t k = 10;
+
+    tinyann::HnswParams p;
+    p.M = 16;
+    p.ef_construction = 200;
+    p.ef_search = 80;
+    p.seed = 42;
+
+    tinyann::Index exact(dim, tinyann::Metric::Cosine);
+    tinyann::HnswIndex hnsw(dim, tinyann::Metric::Cosine, p);
+    std::mt19937_64 rng(321);
+    for (std::size_t i = 0; i < n; ++i) {
+        auto v = random_unit_vector(dim, rng);
+        exact.add(static_cast<std::int64_t>(i), v);
+        hnsw.add(static_cast<std::int64_t>(i), v);
+    }
+    std::vector<std::vector<float>> queries;
+    for (std::size_t i = 0; i < nq; ++i) {
+        queries.push_back(random_unit_vector(dim, rng));
+    }
+
+    // ~50% eligible (even ids)
+    auto even = [](std::int64_t id) { return (id % 2) == 0; };
+    const double rec_even = hnsw.recall_at_k_vs(exact, queries, k, even, /*ef=*/80);
+    std::cout << "recall@10[filtered_even]=" << rec_even << "\n";
+    CHECK(rec_even > 0.9);
+
+    // Selective filter (~10% eligible)
+    auto mod10 = [](std::int64_t id) { return (id % 10) == 0; };
+    const double rec_mod = hnsw.recall_at_k_vs(exact, queries, k, mod10, /*ef=*/120);
+    std::cout << "recall@10[filtered_mod10]=" << rec_mod << "\n";
+    CHECK(rec_mod > 0.85);
+
+    // Pass-all matches unfiltered recall path
+    auto all = [](std::int64_t) { return true; };
+    const double rec_all = hnsw.recall_at_k_vs(exact, queries, k, all, /*ef=*/80);
+    const double rec_unf = hnsw.recall_at_k_vs(exact, queries, k, /*ef=*/80);
+    CHECK_NEAR(rec_all, rec_unf, 1e-12);
+}
+
 void test_remove_update_persist_roundtrip() {
     tinyann::Index exact(2, tinyann::Metric::Cosine);
     exact.add(1, {1.f, 0.f});
@@ -814,6 +946,10 @@ int main() {
     test_hnsw_remove_entry_point();
     test_hnsw_remove_keeps_searchable();
     test_remove_update_persist_roundtrip();
+    test_exact_filtered_search();
+    test_hnsw_filtered_search_basic();
+    test_hnsw_filtered_not_postfilter_topk();
+    test_hnsw_filtered_recall();
 
     std::cout << "passed=" << g_passed << " failed=" << g_failed << "\n";
     return g_failed == 0 ? 0 : 1;
