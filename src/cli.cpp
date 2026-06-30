@@ -1,8 +1,11 @@
 #include "tinyann/tinyann.hpp"
 
+#include <chrono>
 #include <cstdlib>
 #include <fstream>
+#include <iomanip>
 #include <iostream>
+#include <random>
 #include <sstream>
 #include <string>
 #include <unordered_set>
@@ -17,7 +20,10 @@ void print_usage(const char* argv0) {
         << "  Build from vectors + query:\n"
         << "    " << argv0 << " --dim N --metric M --vectors FILE --query FILE [options]\n"
         << "  Load saved index + query:\n"
-        << "    " << argv0 << " --load PATH --query FILE [--index exact|hnsw] [options]\n\n"
+        << "    " << argv0 << " --load PATH --query FILE [--index exact|hnsw] [options]\n"
+        << "  Benchmark (synthetic data):\n"
+        << "    " << argv0 << " --bench --dim N [--n N] [--nq N] [--k K] [--metric M]\n"
+        << "                    [--ef N] [--M N] [--efc N] [--seed N] [--warmup N] [--runs N]\n\n"
         << "Options:\n"
         << "  --dim N           Vector dimension (required unless --load)\n"
         << "  --metric METRIC   cosine | euclidean | l2 | inner_product | ip  (default: cosine)\n"
@@ -32,6 +38,12 @@ void print_usage(const char* argv0) {
         << "  --load PATH       Load index from PATH instead of --vectors\n"
         << "  --allow-ids FILE  Filtered search: only ids listed in FILE (one int64 per line)\n"
         << "  --recall          Also run exact search and print mean recall@k vs exact\n"
+        << "  --bench           Run benchmark mode (exact vs HNSW latency/QPS + recall)\n"
+        << "  --n N             Bench: number of base vectors (default: 20000)\n"
+        << "  --nq N            Bench: number of queries (default: 200)\n"
+        << "  --seed N          Bench: RNG seed (default: 42)\n"
+        << "  --warmup N        Bench: warmup query passes (default: 1)\n"
+        << "  --runs N          Bench: timed query passes (default: 3)\n"
         << "  -h, --help        Show this help\n\n"
         << "Output (per query): one line per hit: <rank>\\t<id>\\t<score>\n";
 }
@@ -50,6 +62,12 @@ struct Options {
     std::string load_path;
     std::string allow_ids_path;
     bool measure_recall = false;
+    bool bench = false;
+    std::size_t n = 20000;
+    std::size_t nq = 200;
+    std::uint64_t seed = 42;
+    std::size_t warmup = 1;
+    std::size_t runs = 3;
     bool help = false;
 };
 
@@ -117,6 +135,28 @@ bool parse_args(int argc, char** argv, Options& opt) {
             opt.allow_ids_path = v;
         } else if (arg == "--recall") {
             opt.measure_recall = true;
+        } else if (arg == "--bench") {
+            opt.bench = true;
+        } else if (arg == "--n") {
+            const char* v = need("--n");
+            if (!v) return false;
+            opt.n = static_cast<std::size_t>(std::stoull(v));
+        } else if (arg == "--nq") {
+            const char* v = need("--nq");
+            if (!v) return false;
+            opt.nq = static_cast<std::size_t>(std::stoull(v));
+        } else if (arg == "--seed") {
+            const char* v = need("--seed");
+            if (!v) return false;
+            opt.seed = static_cast<std::uint64_t>(std::stoull(v));
+        } else if (arg == "--warmup") {
+            const char* v = need("--warmup");
+            if (!v) return false;
+            opt.warmup = static_cast<std::size_t>(std::stoull(v));
+        } else if (arg == "--runs") {
+            const char* v = need("--runs");
+            if (!v) return false;
+            opt.runs = static_cast<std::size_t>(std::stoull(v));
         } else {
             std::cerr << "unknown argument: " << arg << "\n";
             return false;
@@ -247,6 +287,168 @@ bool load_id_set(const std::string& path, std::unordered_set<std::int64_t>& out)
     return true;
 }
 
+std::vector<float> random_unit(std::size_t dim, std::mt19937_64& rng) {
+    std::normal_distribution<float> nd(0.f, 1.f);
+    std::vector<float> v(dim);
+    float n2 = 0.f;
+    for (std::size_t i = 0; i < dim; ++i) {
+        v[i] = nd(rng);
+        n2 += v[i] * v[i];
+    }
+    if (n2 > 0.f) {
+        const float inv = 1.f / std::sqrt(n2);
+        for (float& x : v) {
+            x *= inv;
+        }
+    }
+    return v;
+}
+
+bool same_ids(const std::vector<tinyann::SearchResult>& a,
+              const std::vector<tinyann::SearchResult>& b) {
+    if (a.size() != b.size()) {
+        return false;
+    }
+    for (std::size_t i = 0; i < a.size(); ++i) {
+        if (a[i].id != b[i].id) {
+            return false;
+        }
+    }
+    return true;
+}
+
+template <typename Fn>
+double time_ms(Fn&& fn) {
+    const auto t0 = std::chrono::steady_clock::now();
+    fn();
+    const auto t1 = std::chrono::steady_clock::now();
+    return std::chrono::duration<double, std::milli>(t1 - t0).count();
+}
+
+int run_bench(const Options& opt) {
+    if (opt.dim == 0) {
+        std::cerr << "--bench requires --dim\n";
+        return 2;
+    }
+    if (opt.n == 0 || opt.nq == 0 || opt.k == 0 || opt.runs == 0) {
+        std::cerr << "--n, --nq, --k, --runs must be > 0\n";
+        return 2;
+    }
+
+    std::mt19937_64 rng(opt.seed);
+    std::vector<std::vector<float>> base;
+    base.reserve(opt.n);
+    for (std::size_t i = 0; i < opt.n; ++i) {
+        base.push_back(random_unit(opt.dim, rng));
+    }
+    std::vector<std::vector<float>> queries;
+    queries.reserve(opt.nq);
+    for (std::size_t i = 0; i < opt.nq; ++i) {
+        queries.push_back(random_unit(opt.dim, rng));
+    }
+
+    std::cout << std::fixed << std::setprecision(3);
+    std::cout << "=== tinyann benchmark ===\n";
+    std::cout << "distance_backend=" << tinyann::distance_backend() << "\n";
+    std::cout << "metric=" << tinyann::metric_name(opt.metric) << " dim=" << opt.dim
+              << " n=" << opt.n << " nq=" << opt.nq << " k=" << opt.k << "\n";
+    std::cout << "hnsw: M=" << opt.M << " ef=" << opt.ef << " efc=" << opt.efc
+              << " seed=" << opt.seed << "\n";
+
+    // Build exact
+    tinyann::Index exact(opt.dim, opt.metric);
+    const double exact_build_ms = time_ms([&] {
+        for (std::size_t i = 0; i < opt.n; ++i) {
+            exact.add(static_cast<std::int64_t>(i), base[i]);
+        }
+    });
+
+    // Build HNSW
+    tinyann::HnswParams hp;
+    hp.M = opt.M;
+    hp.ef_construction = opt.efc;
+    hp.ef_search = opt.ef;
+    hp.seed = opt.seed;
+    tinyann::HnswIndex hnsw(opt.dim, opt.metric, hp);
+    const double hnsw_build_ms = time_ms([&] {
+        for (std::size_t i = 0; i < opt.n; ++i) {
+            hnsw.add(static_cast<std::int64_t>(i), base[i]);
+        }
+    });
+
+    std::cout << "build_exact_ms=" << exact_build_ms << "\n";
+    std::cout << "build_hnsw_ms=" << hnsw_build_ms << "\n";
+
+    auto run_exact = [&] {
+        for (const auto& q : queries) {
+            (void)exact.search(q, opt.k);
+        }
+    };
+    auto run_hnsw = [&] {
+        for (const auto& q : queries) {
+            (void)hnsw.search(q, opt.k, opt.ef);
+        }
+    };
+
+    for (std::size_t w = 0; w < opt.warmup; ++w) {
+        run_exact();
+        run_hnsw();
+    }
+
+    double exact_ms_total = 0.0;
+    double hnsw_ms_total = 0.0;
+    for (std::size_t r = 0; r < opt.runs; ++r) {
+        exact_ms_total += time_ms(run_exact);
+        hnsw_ms_total += time_ms(run_hnsw);
+    }
+    const double exact_ms = exact_ms_total / static_cast<double>(opt.runs);
+    const double hnsw_ms = hnsw_ms_total / static_cast<double>(opt.runs);
+    const double exact_qps = 1000.0 * static_cast<double>(opt.nq) / exact_ms;
+    const double hnsw_qps = 1000.0 * static_cast<double>(opt.nq) / hnsw_ms;
+    const double speedup = exact_ms / hnsw_ms;
+
+    std::cout << "search_exact_ms=" << exact_ms << " qps=" << exact_qps
+              << " latency_us=" << (1000.0 * exact_ms / static_cast<double>(opt.nq)) << "\n";
+    std::cout << "search_hnsw_ms=" << hnsw_ms << " qps=" << hnsw_qps
+              << " latency_us=" << (1000.0 * hnsw_ms / static_cast<double>(opt.nq)) << "\n";
+    std::cout << "speedup_vs_exact=" << speedup << "x\n";
+
+    // Quality vs exact (ground truth)
+    const double rec = hnsw.recall_at_k_vs(exact, queries, opt.k, opt.ef);
+    std::cout << "recall@" << opt.k << "=" << rec << "\n";
+
+    // Stability: two HNSW passes must return the same id ranking (determinism).
+    std::size_t stable = 0;
+    for (const auto& q : queries) {
+        const auto a = hnsw.search(q, opt.k, opt.ef);
+        const auto b = hnsw.search(q, opt.k, opt.ef);
+        if (same_ids(a, b)) {
+            ++stable;
+        }
+    }
+    std::cout << "hnsw_id_stable=" << stable << "/" << opt.nq
+              << (stable == opt.nq ? " OK" : " FAIL") << "\n";
+
+    // Compare HNSW ids to exact: fraction of queries where top-1 id matches (sanity).
+    std::size_t top1 = 0;
+    for (const auto& q : queries) {
+        const auto e = exact.search(q, 1);
+        const auto h = hnsw.search(q, 1, opt.ef);
+        if (!e.empty() && !h.empty() && e[0].id == h[0].id) {
+            ++top1;
+        }
+    }
+    std::cout << "top1_id_match_vs_exact=" << top1 << "/" << opt.nq << "\n";
+
+    if (stable != opt.nq) {
+        return 1;
+    }
+    if (rec < 0.85) {
+        std::cerr << "warning: recall below 0.85\n";
+    }
+    return 0;
+}
+
 }  // namespace
 
 int main(int argc, char** argv) {
@@ -267,8 +469,11 @@ int main(int argc, char** argv) {
         return opt.help ? 0 : 2;
     }
 
-    // Always print distance backend once for transparency (stderr).
     std::cerr << "distance_backend=" << tinyann::distance_backend() << "\n";
+
+    if (opt.bench) {
+        return run_bench(opt);
+    }
 
     if (!use_hnsw(opt.index_type) && !use_exact(opt.index_type)) {
         std::cerr << "unknown --index type: " << opt.index_type
@@ -283,7 +488,7 @@ int main(int argc, char** argv) {
         return 2;
     }
     if (!loading && !from_vectors) {
-        std::cerr << "provide --vectors FILE or --load PATH\n";
+        std::cerr << "provide --vectors FILE or --load PATH (or --bench)\n";
         print_usage(argv[0]);
         return 2;
     }
@@ -311,7 +516,7 @@ int main(int argc, char** argv) {
         const bool approx = use_hnsw(opt.index_type);
 
         if (!approx) {
-            tinyann::Index index(1, opt.metric);  // placeholder, replaced below
+            tinyann::Index index(1, opt.metric);
             if (loading) {
                 index = tinyann::Index::load(opt.load_path);
                 std::cerr << "loaded exact index from " << opt.load_path << "\n";
@@ -354,8 +559,7 @@ int main(int argc, char** argv) {
             return 0;
         }
 
-        // HNSW path
-        tinyann::HnswIndex hnsw(1, opt.metric);  // placeholder
+        tinyann::HnswIndex hnsw(1, opt.metric);
         tinyann::Index exact_for_recall(1, opt.metric);
         bool have_exact = false;
 
