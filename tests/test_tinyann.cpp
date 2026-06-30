@@ -1,7 +1,9 @@
 #include "tinyann/tinyann.hpp"
 
 #include <cmath>
+#include <cstdint>
 #include <cstdlib>
+#include <cstring>
 #include <iostream>
 #include <random>
 #include <string>
@@ -383,6 +385,186 @@ void test_hnsw_recall_inner_product() {
     assert_hnsw_recall(tinyann::Metric::InnerProduct, "inner_product");
 }
 
+/// Byte-identical SearchResult lists (id + float bit pattern).
+bool results_byte_identical(const std::vector<tinyann::SearchResult>& a,
+                            const std::vector<tinyann::SearchResult>& b) {
+    if (a.size() != b.size()) {
+        return false;
+    }
+    for (std::size_t i = 0; i < a.size(); ++i) {
+        if (a[i].id != b[i].id) {
+            return false;
+        }
+        std::uint32_t ua = 0, ub = 0;
+        std::memcpy(&ua, &a[i].score, sizeof(float));
+        std::memcpy(&ub, &b[i].score, sizeof(float));
+        if (ua != ub) {
+            return false;
+        }
+    }
+    return true;
+}
+
+std::string temp_path(const char* name) {
+#if defined(_WIN32)
+    return std::string(std::getenv("TEMP") ? std::getenv("TEMP") : ".") + "\\" + name;
+#else
+    return std::string("/tmp/") + name;
+#endif
+}
+
+void test_exact_save_load_identical_search() {
+    tinyann::Index idx(3, tinyann::Metric::Cosine);
+    idx.add(10, {1.f, 0.f, 0.f});
+    idx.add(20, {0.f, 1.f, 0.f});
+    idx.add(30, {0.7f, 0.7f, 0.f});
+    idx.add(40, {-1.f, 0.f, 0.f});
+
+    const std::vector<std::vector<float>> queries = {
+        {1.f, 0.f, 0.f},
+        {0.f, 1.f, 0.f},
+        {0.5f, 0.5f, 0.f},
+        {0.f, 0.f, 1.f},
+    };
+
+    std::vector<std::vector<tinyann::SearchResult>> before;
+    for (const auto& q : queries) {
+        before.push_back(idx.search(q, 3));
+    }
+
+    const std::string path = temp_path("tinyann_exact_test.bin");
+    idx.save(path);
+    tinyann::Index loaded = tinyann::Index::load(path);
+    CHECK(loaded.dimension() == idx.dimension());
+    CHECK(loaded.metric() == idx.metric());
+    CHECK(loaded.size() == idx.size());
+
+    for (std::size_t i = 0; i < queries.size(); ++i) {
+        const auto after = loaded.search(queries[i], 3);
+        CHECK(results_byte_identical(before[i], after));
+    }
+
+    // Empty index round-trip
+    tinyann::Index empty(2, tinyann::Metric::Euclidean);
+    const std::string path_empty = temp_path("tinyann_exact_empty.bin");
+    empty.save(path_empty);
+    auto loaded_empty = tinyann::Index::load(path_empty);
+    CHECK(loaded_empty.empty());
+    CHECK(loaded_empty.search({1.f, 0.f}, 5).empty());
+}
+
+void test_exact_load_rejects_hnsw_file() {
+    tinyann::HnswParams p;
+    p.M = 4;
+    p.ef_construction = 16;
+    p.ef_search = 8;
+    tinyann::HnswIndex h(2, tinyann::Metric::InnerProduct, p);
+    h.add(1, {1.f, 0.f});
+    const std::string path = temp_path("tinyann_hnsw_as_exact.bin");
+    h.save(path);
+    bool threw = false;
+    try {
+        (void)tinyann::Index::load(path);
+    } catch (const std::runtime_error&) {
+        threw = true;
+    }
+    CHECK(threw);
+}
+
+void test_hnsw_save_load_identical_search() {
+    tinyann::HnswParams p;
+    p.M = 12;
+    p.ef_construction = 100;
+    p.ef_search = 40;
+    p.seed = 77;
+
+    const std::size_t dim = 16;
+    const std::size_t n = 500;
+    const std::size_t nq = 30;
+    const std::size_t k = 10;
+
+    tinyann::HnswIndex hnsw(dim, tinyann::Metric::Cosine, p);
+    std::mt19937_64 rng(4242);
+    for (std::size_t i = 0; i < n; ++i) {
+        hnsw.add(static_cast<std::int64_t>(i), random_unit_vector(dim, rng));
+    }
+
+    std::vector<std::vector<float>> queries;
+    for (std::size_t i = 0; i < nq; ++i) {
+        queries.push_back(random_unit_vector(dim, rng));
+    }
+
+    std::vector<std::vector<tinyann::SearchResult>> before;
+    for (const auto& q : queries) {
+        before.push_back(hnsw.search(q, k, /*ef=*/40));
+    }
+
+    const std::string path = temp_path("tinyann_hnsw_test.bin");
+    hnsw.save(path);
+    tinyann::HnswIndex loaded = tinyann::HnswIndex::load(path);
+
+    CHECK(loaded.dimension() == hnsw.dimension());
+    CHECK(loaded.metric() == hnsw.metric());
+    CHECK(loaded.size() == hnsw.size());
+    CHECK(loaded.params().M == hnsw.params().M);
+    CHECK(loaded.params().ef_construction == hnsw.params().ef_construction);
+    CHECK(loaded.params().ef_search == hnsw.params().ef_search);
+
+    for (std::size_t i = 0; i < queries.size(); ++i) {
+        const auto after = loaded.search(queries[i], k, /*ef=*/40);
+        CHECK(results_byte_identical(before[i], after));
+    }
+
+    // Default search() also identical
+    for (std::size_t i = 0; i < queries.size(); ++i) {
+        CHECK(results_byte_identical(hnsw.search(queries[i], k), loaded.search(queries[i], k)));
+    }
+}
+
+void test_hnsw_load_rejects_exact_file() {
+    tinyann::Index idx(2, tinyann::Metric::Cosine);
+    idx.add(1, {1.f, 0.f});
+    const std::string path = temp_path("tinyann_exact_as_hnsw.bin");
+    idx.save(path);
+    bool threw = false;
+    try {
+        (void)tinyann::HnswIndex::load(path);
+    } catch (const std::runtime_error&) {
+        threw = true;
+    }
+    CHECK(threw);
+}
+
+void test_persistence_all_metrics() {
+    for (auto metric : {tinyann::Metric::Cosine, tinyann::Metric::Euclidean,
+                        tinyann::Metric::InnerProduct}) {
+        tinyann::Index exact(2, metric);
+        exact.add(1, {1.f, 0.f});
+        exact.add(2, {0.f, 1.f});
+        exact.add(3, {0.5f, 0.5f});
+        const auto q = std::vector<float>{1.f, 0.f};
+        const auto before = exact.search(q, 2);
+        const std::string path = temp_path("tinyann_metric_roundtrip.bin");
+        exact.save(path);
+        const auto after = tinyann::Index::load(path).search(q, 2);
+        CHECK(results_byte_identical(before, after));
+
+        tinyann::HnswParams p;
+        p.M = 4;
+        p.ef_construction = 32;
+        p.ef_search = 16;
+        p.seed = 3;
+        tinyann::HnswIndex h(2, metric, p);
+        h.add(1, {1.f, 0.f});
+        h.add(2, {0.f, 1.f});
+        h.add(3, {0.5f, 0.5f});
+        const auto hb = h.search(q, 2);
+        h.save(path);
+        const auto ha = tinyann::HnswIndex::load(path).search(q, 2);
+        CHECK(results_byte_identical(hb, ha));
+    }
+}
+
 }  // namespace
 
 int main() {
@@ -413,6 +595,11 @@ int main() {
     test_hnsw_recall_cosine();
     test_hnsw_recall_euclidean();
     test_hnsw_recall_inner_product();
+    test_exact_save_load_identical_search();
+    test_exact_load_rejects_hnsw_file();
+    test_hnsw_save_load_identical_search();
+    test_hnsw_load_rejects_exact_file();
+    test_persistence_all_metrics();
 
     std::cout << "passed=" << g_passed << " failed=" << g_failed << "\n";
     return g_failed == 0 ? 0 : 1;

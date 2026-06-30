@@ -3,11 +3,15 @@
 #include <algorithm>
 #include <cmath>
 #include <cstdint>
+#include <cstring>
+#include <fstream>
 #include <limits>
 #include <queue>
 #include <random>
+#include <sstream>
 #include <stdexcept>
 #include <string>
+#include <type_traits>
 #include <unordered_set>
 #include <utility>
 #include <vector>
@@ -130,11 +134,6 @@ inline void rank_results(std::vector<SearchResult>& results, Metric metric) {
 }
 
 /// Recall@k of approximate results vs exact ground truth.
-///
-/// Defined as |approx_ids ∩ exact_ids| / |exact_ids|, where both lists are the
-/// top-k (or fewer if the index is smaller) results for the same query.
-/// Duplicate ids in either list are treated as a set (each id counted once).
-/// Returns 1.0 when exact is empty (vacuously perfect).
 inline double recall_at_k(const std::vector<SearchResult>& approx,
                           const std::vector<SearchResult>& exact) {
     if (exact.empty()) {
@@ -173,14 +172,115 @@ inline double mean_recall_at_k(
 }
 
 // ---------------------------------------------------------------------------
+// Binary persistence helpers (little-endian host; fixed-width types)
+// Format: magic "TANN" | version u32 | kind u32 | ... payload ...
+// kind: 1 = Exact Index, 2 = HnswIndex
+// ---------------------------------------------------------------------------
+
+namespace detail {
+
+constexpr char kMagic[4] = {'T', 'A', 'N', 'N'};
+constexpr std::uint32_t kFormatVersion = 1;
+constexpr std::uint32_t kKindExact = 1;
+constexpr std::uint32_t kKindHnsw = 2;
+
+inline void write_bytes(std::ostream& out, const void* data, std::size_t n) {
+    out.write(reinterpret_cast<const char*>(data), static_cast<std::streamsize>(n));
+    if (!out) {
+        throw std::runtime_error("tinyann: failed writing to stream");
+    }
+}
+
+inline void read_bytes(std::istream& in, void* data, std::size_t n) {
+    in.read(reinterpret_cast<char*>(data), static_cast<std::streamsize>(n));
+    if (!in || static_cast<std::size_t>(in.gcount()) != n) {
+        throw std::runtime_error("tinyann: failed reading from stream (truncated or corrupt)");
+    }
+}
+
+template <typename T>
+inline void write_pod(std::ostream& out, const T& v) {
+    static_assert(std::is_trivially_copyable<T>::value, "POD required");
+    write_bytes(out, &v, sizeof(T));
+}
+
+template <typename T>
+inline T read_pod(std::istream& in) {
+    static_assert(std::is_trivially_copyable<T>::value, "POD required");
+    T v{};
+    read_bytes(in, &v, sizeof(T));
+    return v;
+}
+
+inline void write_header(std::ostream& out, std::uint32_t kind) {
+    write_bytes(out, kMagic, 4);
+    write_pod(out, kFormatVersion);
+    write_pod(out, kind);
+}
+
+/// Read magic+version+kind; returns kind. Throws on mismatch.
+inline std::uint32_t read_header(std::istream& in, std::uint32_t expected_kind) {
+    char magic[4];
+    read_bytes(in, magic, 4);
+    if (std::memcmp(magic, kMagic, 4) != 0) {
+        throw std::runtime_error("tinyann: invalid file magic (not a tinyann index)");
+    }
+    const auto ver = read_pod<std::uint32_t>(in);
+    if (ver != kFormatVersion) {
+        throw std::runtime_error("tinyann: unsupported format version " + std::to_string(ver));
+    }
+    const auto kind = read_pod<std::uint32_t>(in);
+    if (kind != expected_kind) {
+        throw std::runtime_error("tinyann: index kind mismatch (file kind=" + std::to_string(kind) +
+                                 ", expected " + std::to_string(expected_kind) + ")");
+    }
+    return kind;
+}
+
+inline Metric metric_from_u32(std::uint32_t m) {
+    if (m > static_cast<std::uint32_t>(Metric::InnerProduct)) {
+        throw std::runtime_error("tinyann: invalid metric id in file");
+    }
+    return static_cast<Metric>(m);
+}
+
+inline void write_ids_and_vectors(std::ostream& out, std::size_t dimension, Metric metric,
+                                  const std::vector<std::int64_t>& ids,
+                                  const std::vector<float>& data) {
+    write_pod(out, static_cast<std::uint32_t>(metric));
+    write_pod(out, static_cast<std::uint64_t>(dimension));
+    write_pod(out, static_cast<std::uint64_t>(ids.size()));
+    if (!ids.empty()) {
+        write_bytes(out, ids.data(), ids.size() * sizeof(std::int64_t));
+    }
+    if (!data.empty()) {
+        write_bytes(out, data.data(), data.size() * sizeof(float));
+    }
+}
+
+inline void read_ids_and_vectors(std::istream& in, std::size_t& dimension, Metric& metric,
+                                 std::vector<std::int64_t>& ids, std::vector<float>& data) {
+    metric = metric_from_u32(read_pod<std::uint32_t>(in));
+    dimension = static_cast<std::size_t>(read_pod<std::uint64_t>(in));
+    const auto count = static_cast<std::size_t>(read_pod<std::uint64_t>(in));
+    if (dimension == 0) {
+        throw std::runtime_error("tinyann: corrupt file (dimension == 0)");
+    }
+    ids.resize(count);
+    data.resize(count * dimension);
+    if (count > 0) {
+        read_bytes(in, ids.data(), count * sizeof(std::int64_t));
+        read_bytes(in, data.data(), count * dimension * sizeof(float));
+    }
+}
+
+}  // namespace detail
+
+// ---------------------------------------------------------------------------
 // Exact (brute-force) index
 // ---------------------------------------------------------------------------
 
 /// In-memory exact (brute-force) vector similarity index.
-///
-/// Ranking:
-/// - Cosine and InnerProduct are similarities (higher score = better/closer)
-/// - Euclidean is a distance (lower score = better/closer)
 class Index {
 public:
     explicit Index(std::size_t dimension, Metric metric = Metric::Cosine)
@@ -258,10 +358,37 @@ public:
         return metric_score(metric_, a.data(), b.data(), dimension_);
     }
 
+    /// Save compact binary index to path (creates/overwrites file).
+    void save(const std::string& path) const {
+        std::ofstream out(path, std::ios::binary | std::ios::trunc);
+        if (!out) {
+            throw std::runtime_error("tinyann::Index::save: cannot open " + path);
+        }
+        detail::write_header(out, detail::kKindExact);
+        detail::write_ids_and_vectors(out, dimension_, metric_, ids_, data_);
+    }
+
+    /// Load exact index from a file written by Index::save.
+    static Index load(const std::string& path) {
+        std::ifstream in(path, std::ios::binary);
+        if (!in) {
+            throw std::runtime_error("tinyann::Index::load: cannot open " + path);
+        }
+        detail::read_header(in, detail::kKindExact);
+        std::size_t dimension = 0;
+        Metric metric = Metric::Cosine;
+        std::vector<std::int64_t> ids;
+        std::vector<float> data;
+        detail::read_ids_and_vectors(in, dimension, metric, ids, data);
+        Index idx(dimension, metric);
+        idx.ids_ = std::move(ids);
+        idx.data_ = std::move(data);
+        return idx;
+    }
+
     static const char* metric_name(Metric m) { return tinyann::metric_name(m); }
     static Metric parse_metric(const std::string& name) { return tinyann::parse_metric(name); }
 
-    /// Access underlying storage (for building ANN from the same data, tests).
     const std::vector<std::int64_t>& ids() const noexcept { return ids_; }
     const std::vector<float>& data() const noexcept { return data_; }
 
@@ -273,13 +400,7 @@ private:
 };
 
 // ---------------------------------------------------------------------------
-// Approximate index: HNSW (Hierarchical Navigable Small World)
-//
-// Chosen over IVF because:
-// - Incremental inserts with no separate k-means training phase (matches add())
-// - Strong in-memory recall/latency tradeoff for general k-NN workloads
-// - Tunable at query time via ef_search without rebuilding clusters
-// - Modern default for in-process ANN libraries (e.g. hnswlib, usearch)
+// Approximate index: HNSW
 // ---------------------------------------------------------------------------
 
 /// Parameters for HNSW graph construction and search.
@@ -295,8 +416,6 @@ struct HnswParams {
 };
 
 /// In-memory approximate k-NN index based on HNSW.
-/// Same metrics and SearchResult ranking semantics as Index; search may miss
-/// some true neighbors in exchange for sub-linear query cost on larger sets.
 class HnswIndex {
 public:
     explicit HnswIndex(std::size_t dimension, Metric metric = Metric::Cosine,
@@ -305,17 +424,8 @@ public:
           metric_(metric),
           params_(params),
           rng_(params.seed),
-          // level mult ≈ 1/ln(M); clamp M to avoid ln(1)
           level_mult_(1.0 / std::log(std::max<std::size_t>(params.M, 2))) {
-        if (dimension_ == 0) {
-            throw std::invalid_argument("tinyann::HnswIndex: dimension must be > 0");
-        }
-        if (params_.M == 0) {
-            throw std::invalid_argument("tinyann::HnswIndex: M must be > 0");
-        }
-        if (params_.ef_construction == 0 || params_.ef_search == 0) {
-            throw std::invalid_argument("tinyann::HnswIndex: ef_construction/ef_search must be > 0");
-        }
+        validate_params(dimension_, params_);
     }
 
     std::size_t dimension() const noexcept { return dimension_; }
@@ -344,7 +454,6 @@ public:
 
         const int level = random_level();
         levels_.push_back(level);
-        // neighbors_[node][layer] = list of neighbor node indices
         neighbors_.emplace_back();
         neighbors_.back().resize(static_cast<std::size_t>(level) + 1);
 
@@ -355,25 +464,23 @@ public:
         }
 
         int curr = entry_point_;
-        // Greedy search from top layer down to level+1
         for (int lc = max_level_; lc > level; --lc) {
             curr = greedy_update(node, curr, lc);
         }
 
-        // Insert on layers level .. 0
         for (int lc = std::min(level, max_level_); lc >= 0; --lc) {
-            auto candidates = search_layer(node, /*query_is_node=*/true, curr, params_.ef_construction, lc);
+            auto candidates =
+                search_layer(node, /*query_is_node=*/true, curr, params_.ef_construction, lc);
             const std::size_t M_max = (lc == 0) ? (params_.M * 2) : params_.M;
             auto selected = select_neighbors(candidates, M_max);
 
             neighbors_[static_cast<std::size_t>(node)][static_cast<std::size_t>(lc)] = selected;
 
-            // Add reverse edges and prune
             for (int nb : selected) {
-                auto& nb_links = neighbors_[static_cast<std::size_t>(nb)][static_cast<std::size_t>(lc)];
+                auto& nb_links =
+                    neighbors_[static_cast<std::size_t>(nb)][static_cast<std::size_t>(lc)];
                 nb_links.push_back(node);
                 if (nb_links.size() > M_max) {
-                    // Prune neighbor's links to M_max closest to nb
                     std::vector<std::pair<float, int>> scored;
                     scored.reserve(nb_links.size());
                     for (int x : nb_links) {
@@ -389,7 +496,6 @@ public:
             }
 
             if (!candidates.empty()) {
-                // Next layer enters from the closest candidate
                 curr = candidates[0].second;
             }
         }
@@ -400,12 +506,10 @@ public:
         }
     }
 
-    /// Approximate k-NN search. Uses params().ef_search (must be >= k for best recall).
     std::vector<SearchResult> search(const std::vector<float>& query, std::size_t k) const {
         return search(query, k, params_.ef_search);
     }
 
-    /// Approximate k-NN with explicit ef (candidate list width). Larger ef → higher recall.
     std::vector<SearchResult> search(const std::vector<float>& query, std::size_t k,
                                      std::size_t ef) const {
         if (query.size() != dimension_) {
@@ -442,9 +546,6 @@ public:
         return out;
     }
 
-    /// Mean recall@k of this index vs an exact Index on the given queries.
-    /// Both indexes must use the same metric and contain the same vectors/ids
-    /// for the measure to be meaningful.
     double recall_at_k_vs(const Index& exact, const std::vector<std::vector<float>>& queries,
                           std::size_t k, std::size_t ef = 0) const {
         if (ef == 0) {
@@ -462,8 +563,123 @@ public:
         return sum / static_cast<double>(queries.size());
     }
 
+    /// Save compact binary index including the full HNSW graph to path.
+    void save(const std::string& path) const {
+        std::ofstream out(path, std::ios::binary | std::ios::trunc);
+        if (!out) {
+            throw std::runtime_error("tinyann::HnswIndex::save: cannot open " + path);
+        }
+        detail::write_header(out, detail::kKindHnsw);
+        detail::write_ids_and_vectors(out, dimension_, metric_, ids_, data_);
+
+        detail::write_pod(out, static_cast<std::uint64_t>(params_.M));
+        detail::write_pod(out, static_cast<std::uint64_t>(params_.ef_construction));
+        detail::write_pod(out, static_cast<std::uint64_t>(params_.ef_search));
+        detail::write_pod(out, params_.seed);
+        detail::write_pod(out, static_cast<std::int32_t>(entry_point_));
+        detail::write_pod(out, static_cast<std::int32_t>(max_level_));
+
+        const std::size_t n = ids_.size();
+        for (std::size_t i = 0; i < n; ++i) {
+            detail::write_pod(out, static_cast<std::int32_t>(levels_[i]));
+        }
+        for (std::size_t i = 0; i < n; ++i) {
+            const auto& layers = neighbors_[i];
+            detail::write_pod(out, static_cast<std::uint32_t>(layers.size()));
+            for (const auto& links : layers) {
+                detail::write_pod(out, static_cast<std::uint32_t>(links.size()));
+                for (int nb : links) {
+                    detail::write_pod(out, static_cast<std::int32_t>(nb));
+                }
+            }
+        }
+
+        // Persist RNG so subsequent add() sequences match if the same operations continue.
+        std::string rng_state;
+        {
+            std::ostringstream oss;
+            oss << rng_;
+            rng_state = oss.str();
+        }
+        detail::write_pod(out, static_cast<std::uint64_t>(rng_state.size()));
+        if (!rng_state.empty()) {
+            detail::write_bytes(out, rng_state.data(), rng_state.size());
+        }
+    }
+
+    /// Load HNSW index from a file written by HnswIndex::save.
+    /// Restored graph yields search results identical to the pre-save index.
+    static HnswIndex load(const std::string& path) {
+        std::ifstream in(path, std::ios::binary);
+        if (!in) {
+            throw std::runtime_error("tinyann::HnswIndex::load: cannot open " + path);
+        }
+        detail::read_header(in, detail::kKindHnsw);
+
+        std::size_t dimension = 0;
+        Metric metric = Metric::Cosine;
+        std::vector<std::int64_t> ids;
+        std::vector<float> data;
+        detail::read_ids_and_vectors(in, dimension, metric, ids, data);
+
+        HnswParams params;
+        params.M = static_cast<std::size_t>(detail::read_pod<std::uint64_t>(in));
+        params.ef_construction = static_cast<std::size_t>(detail::read_pod<std::uint64_t>(in));
+        params.ef_search = static_cast<std::size_t>(detail::read_pod<std::uint64_t>(in));
+        params.seed = detail::read_pod<std::uint64_t>(in);
+
+        HnswIndex idx(dimension, metric, params);
+        idx.ids_ = std::move(ids);
+        idx.data_ = std::move(data);
+        idx.entry_point_ = detail::read_pod<std::int32_t>(in);
+        idx.max_level_ = detail::read_pod<std::int32_t>(in);
+
+        const std::size_t n = idx.ids_.size();
+        idx.levels_.resize(n);
+        for (std::size_t i = 0; i < n; ++i) {
+            idx.levels_[i] = detail::read_pod<std::int32_t>(in);
+        }
+        idx.neighbors_.assign(n, {});
+        for (std::size_t i = 0; i < n; ++i) {
+            const auto n_layers = detail::read_pod<std::uint32_t>(in);
+            idx.neighbors_[i].resize(n_layers);
+            for (std::uint32_t lc = 0; lc < n_layers; ++lc) {
+                const auto n_links = detail::read_pod<std::uint32_t>(in);
+                idx.neighbors_[i][lc].resize(n_links);
+                for (std::uint32_t j = 0; j < n_links; ++j) {
+                    idx.neighbors_[i][lc][j] = detail::read_pod<std::int32_t>(in);
+                }
+            }
+        }
+
+        const auto rng_len = static_cast<std::size_t>(detail::read_pod<std::uint64_t>(in));
+        if (rng_len > 0) {
+            std::string rng_state(rng_len, '\0');
+            detail::read_bytes(in, &rng_state[0], rng_len);
+            std::istringstream iss(rng_state);
+            iss >> idx.rng_;
+            if (!iss) {
+                // Fall back to seed if stream restore fails (should not happen for our writes).
+                idx.rng_.seed(params.seed);
+            }
+        }
+
+        return idx;
+    }
+
 private:
-    // Priority queue element: (distance, node); min-heap via greater
+    static void validate_params(std::size_t dimension, const HnswParams& params) {
+        if (dimension == 0) {
+            throw std::invalid_argument("tinyann::HnswIndex: dimension must be > 0");
+        }
+        if (params.M == 0) {
+            throw std::invalid_argument("tinyann::HnswIndex: M must be > 0");
+        }
+        if (params.ef_construction == 0 || params.ef_search == 0) {
+            throw std::invalid_argument("tinyann::HnswIndex: ef_construction/ef_search must be > 0");
+        }
+    }
+
     using DistNode = std::pair<float, int>;
 
     float distance_nodes(int a, int b) const {
@@ -479,13 +695,10 @@ private:
 
     int random_level() {
         std::uniform_real_distribution<double> dist(0.0, 1.0);
-        // floor(-ln(U) * level_mult) — standard HNSW level sampling
         const double u = std::max(dist(rng_), 1e-12);
-        const int lvl = static_cast<int>(-std::log(u) * level_mult_);
-        return lvl;
+        return static_cast<int>(-std::log(u) * level_mult_);
     }
 
-    /// Greedy descent toward node `target` on a single layer (used during insert).
     int greedy_update(int target, int enter, int layer) const {
         int curr = enter;
         float d = distance_nodes(target, curr);
@@ -526,8 +739,6 @@ private:
         return curr;
     }
 
-    /// Search layer returning up to `ef` closest nodes as (dist, node), sorted ascending dist.
-    /// When query_is_node, query vector is taken from data_[query_node].
     std::vector<DistNode> search_layer(int query_node, bool /*query_is_node*/, int enter,
                                        std::size_t ef, int layer) const {
         const float* q = data_.data() + static_cast<std::size_t>(query_node) * dimension_;
@@ -539,9 +750,7 @@ private:
         std::unordered_set<int> visited;
         visited.reserve(ef * 4);
 
-        // candidates: min-heap (closest first)
         std::priority_queue<DistNode, std::vector<DistNode>, std::greater<DistNode>> candidates;
-        // results: max-heap of size <= ef (farthest of current best on top)
         std::priority_queue<DistNode> results;
 
         const float d0 = distance_query(q, enter);
@@ -603,7 +812,6 @@ private:
     std::vector<std::int64_t> ids_;
     std::vector<float> data_;
     std::vector<int> levels_;
-    // neighbors_[node][layer] -> neighbor node indices
     std::vector<std::vector<std::vector<int>>> neighbors_;
     int entry_point_ = -1;
     int max_level_ = -1;

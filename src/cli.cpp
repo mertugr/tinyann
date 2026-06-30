@@ -13,17 +13,22 @@ void print_usage(const char* argv0) {
     std::cerr
         << "tinyann — small in-memory vector similarity search\n\n"
         << "Usage:\n"
-        << "  " << argv0 << " --dim N --metric METRIC --vectors FILE --query FILE [options]\n\n"
+        << "  Build from vectors + query:\n"
+        << "    " << argv0 << " --dim N --metric M --vectors FILE --query FILE [options]\n"
+        << "  Load saved index + query:\n"
+        << "    " << argv0 << " --load PATH --query FILE [--index exact|hnsw] [options]\n\n"
         << "Options:\n"
-        << "  --dim N           Vector dimension (required)\n"
+        << "  --dim N           Vector dimension (required unless --load)\n"
         << "  --metric METRIC   cosine | euclidean | l2 | inner_product | ip  (default: cosine)\n"
         << "  --vectors FILE    Text file: one vector per line: <id> <f1> <f2> ... <fN>\n"
-        << "  --query FILE      Query vector file: \"<id> <f1> ... <fN>\" or \"<f1> ... <fN>\"\n"
+        << "  --query FILE      Query vector file (optional if only --save)\n"
         << "  --k K             Number of nearest neighbors (default: 10)\n"
         << "  --index TYPE      exact | brute | hnsw | approx  (default: exact)\n"
         << "  --ef N            HNSW ef_search candidate list size (default: 64)\n"
         << "  --M N             HNSW M (max links per layer; default: 16)\n"
         << "  --efc N           HNSW ef_construction (default: 200)\n"
+        << "  --save PATH       Write built/loaded index to PATH (binary)\n"
+        << "  --load PATH       Load index from PATH instead of --vectors\n"
         << "  --recall          Also run exact search and print mean recall@k vs exact\n"
         << "  -h, --help        Show this help\n\n"
         << "Output (per query): one line per hit: <rank>\\t<id>\\t<score>\n";
@@ -35,10 +40,12 @@ struct Options {
     std::string vectors_path;
     std::string query_path;
     std::size_t k = 10;
-    std::string index_type = "exact";  // exact | hnsw
+    std::string index_type = "exact";
     std::size_t ef = 64;
     std::size_t M = 16;
     std::size_t efc = 200;
+    std::string save_path;
+    std::string load_path;
     bool measure_recall = false;
     bool help = false;
 };
@@ -93,6 +100,14 @@ bool parse_args(int argc, char** argv, Options& opt) {
             const char* v = need("--efc");
             if (!v) return false;
             opt.efc = static_cast<std::size_t>(std::stoull(v));
+        } else if (arg == "--save") {
+            const char* v = need("--save");
+            if (!v) return false;
+            opt.save_path = v;
+        } else if (arg == "--load") {
+            const char* v = need("--load");
+            if (!v) return false;
+            opt.load_path = v;
         } else if (arg == "--recall") {
             opt.measure_recall = true;
         } else {
@@ -223,72 +238,140 @@ int main(int argc, char** argv) {
         return opt.help ? 0 : 2;
     }
 
-    if (opt.dim == 0 || opt.vectors_path.empty() || opt.query_path.empty()) {
-        std::cerr << "--dim, --vectors and --query are required\n";
-        print_usage(argv[0]);
-        return 2;
-    }
     if (!use_hnsw(opt.index_type) && !use_exact(opt.index_type)) {
         std::cerr << "unknown --index type: " << opt.index_type
                   << " (use exact|brute|hnsw|approx)\n";
         return 2;
     }
 
+    const bool loading = !opt.load_path.empty();
+    const bool from_vectors = !opt.vectors_path.empty();
+    if (loading && from_vectors) {
+        std::cerr << "use either --load or --vectors, not both\n";
+        return 2;
+    }
+    if (!loading && !from_vectors) {
+        std::cerr << "provide --vectors FILE or --load PATH\n";
+        print_usage(argv[0]);
+        return 2;
+    }
+    if (from_vectors && opt.dim == 0) {
+        std::cerr << "--dim is required when building from --vectors\n";
+        return 2;
+    }
+    if (opt.query_path.empty() && opt.save_path.empty()) {
+        std::cerr << "provide --query FILE and/or --save PATH\n";
+        return 2;
+    }
+
     try {
-        LoadedData data;
-        if (!load_vectors_file(opt.vectors_path, opt.dim, data)) {
-            return 1;
-        }
-        std::vector<std::vector<float>> queries;
-        if (!load_queries(opt.query_path, opt.dim, queries)) {
-            return 1;
-        }
-
-        // Always build exact index when measuring recall (or when index is exact).
-        tinyann::Index exact(opt.dim, opt.metric);
-        for (std::size_t i = 0; i < data.ids.size(); ++i) {
-            exact.add(data.ids[i], data.vectors[i]);
-        }
-
         const bool approx = use_hnsw(opt.index_type);
 
         if (!approx) {
-            std::cerr << "index=exact size=" << exact.size() << " dim=" << exact.dimension()
-                      << " metric=" << tinyann::metric_name(exact.metric()) << " k=" << opt.k
-                      << "\n";
-            for (std::size_t qi = 0; qi < queries.size(); ++qi) {
-                if (queries.size() > 1) {
-                    std::cout << "# query " << qi << "\n";
+            tinyann::Index index(1, opt.metric);  // placeholder, replaced below
+            if (loading) {
+                index = tinyann::Index::load(opt.load_path);
+                std::cerr << "loaded exact index from " << opt.load_path << "\n";
+            } else {
+                index = tinyann::Index(opt.dim, opt.metric);
+                LoadedData data;
+                if (!load_vectors_file(opt.vectors_path, opt.dim, data)) {
+                    return 1;
                 }
-                print_hits(exact.search(queries[qi], opt.k));
+                for (std::size_t i = 0; i < data.ids.size(); ++i) {
+                    index.add(data.ids[i], data.vectors[i]);
+                }
+            }
+
+            if (!opt.save_path.empty()) {
+                index.save(opt.save_path);
+                std::cerr << "saved exact index to " << opt.save_path << "\n";
+            }
+
+            std::cerr << "index=exact size=" << index.size() << " dim=" << index.dimension()
+                      << " metric=" << tinyann::metric_name(index.metric()) << " k=" << opt.k
+                      << "\n";
+
+            if (!opt.query_path.empty()) {
+                std::vector<std::vector<float>> queries;
+                if (!load_queries(opt.query_path, index.dimension(), queries)) {
+                    return 1;
+                }
+                for (std::size_t qi = 0; qi < queries.size(); ++qi) {
+                    if (queries.size() > 1) {
+                        std::cout << "# query " << qi << "\n";
+                    }
+                    print_hits(index.search(queries[qi], opt.k));
+                }
             }
             return 0;
         }
 
-        tinyann::HnswParams hp;
-        hp.M = opt.M;
-        hp.ef_construction = opt.efc;
-        hp.ef_search = opt.ef;
-        tinyann::HnswIndex hnsw(opt.dim, opt.metric, hp);
-        for (std::size_t i = 0; i < data.ids.size(); ++i) {
-            hnsw.add(data.ids[i], data.vectors[i]);
+        // HNSW path
+        tinyann::HnswIndex hnsw(1, opt.metric);  // placeholder
+        tinyann::Index exact_for_recall(1, opt.metric);
+        bool have_exact = false;
+
+        if (loading) {
+            hnsw = tinyann::HnswIndex::load(opt.load_path);
+            std::cerr << "loaded hnsw index from " << opt.load_path << "\n";
+            if (opt.ef != 64) {
+                hnsw.set_ef_search(opt.ef);
+            }
+        } else {
+            tinyann::HnswParams hp;
+            hp.M = opt.M;
+            hp.ef_construction = opt.efc;
+            hp.ef_search = opt.ef;
+            hnsw = tinyann::HnswIndex(opt.dim, opt.metric, hp);
+            exact_for_recall = tinyann::Index(opt.dim, opt.metric);
+            have_exact = opt.measure_recall;
+
+            LoadedData data;
+            if (!load_vectors_file(opt.vectors_path, opt.dim, data)) {
+                return 1;
+            }
+            for (std::size_t i = 0; i < data.ids.size(); ++i) {
+                hnsw.add(data.ids[i], data.vectors[i]);
+                if (have_exact) {
+                    exact_for_recall.add(data.ids[i], data.vectors[i]);
+                }
+            }
+        }
+
+        if (!opt.save_path.empty()) {
+            hnsw.save(opt.save_path);
+            std::cerr << "saved hnsw index to " << opt.save_path << "\n";
         }
 
         std::cerr << "index=hnsw size=" << hnsw.size() << " dim=" << hnsw.dimension()
                   << " metric=" << tinyann::metric_name(hnsw.metric()) << " k=" << opt.k
-                  << " M=" << opt.M << " ef=" << opt.ef << " efc=" << opt.efc << "\n";
+                  << " M=" << hnsw.params().M << " ef=" << hnsw.params().ef_search
+                  << " efc=" << hnsw.params().ef_construction << "\n";
 
-        for (std::size_t qi = 0; qi < queries.size(); ++qi) {
-            if (queries.size() > 1) {
-                std::cout << "# query " << qi << "\n";
+        if (!opt.query_path.empty()) {
+            std::vector<std::vector<float>> queries;
+            if (!load_queries(opt.query_path, hnsw.dimension(), queries)) {
+                return 1;
             }
-            print_hits(hnsw.search(queries[qi], opt.k, opt.ef));
-        }
+            for (std::size_t qi = 0; qi < queries.size(); ++qi) {
+                if (queries.size() > 1) {
+                    std::cout << "# query " << qi << "\n";
+                }
+                print_hits(hnsw.search(queries[qi], opt.k, hnsw.params().ef_search));
+            }
 
-        if (opt.measure_recall) {
-            const double rec = hnsw.recall_at_k_vs(exact, queries, opt.k, opt.ef);
-            std::cerr << "recall@" << opt.k << "=" << rec << " (vs exact, " << queries.size()
-                      << " queries)\n";
+            if (opt.measure_recall) {
+                if (!have_exact) {
+                    std::cerr << "--recall with --load requires rebuilding exact from --vectors; "
+                                 "skipping recall\n";
+                } else {
+                    const double rec =
+                        hnsw.recall_at_k_vs(exact_for_recall, queries, opt.k, hnsw.params().ef_search);
+                    std::cerr << "recall@" << opt.k << "=" << rec << " (vs exact, " << queries.size()
+                              << " queries)\n";
+                }
+            }
         }
     } catch (const std::exception& e) {
         std::cerr << "error: " << e.what() << "\n";
