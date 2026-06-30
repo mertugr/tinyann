@@ -17,6 +17,17 @@
 #include <utility>
 #include <vector>
 
+#if defined(__AVX2__)
+#include <immintrin.h>
+#elif defined(__SSE2__) || defined(_M_X64) || defined(_M_AMD64)
+#include <emmintrin.h>
+#if defined(__FMA__)
+#include <immintrin.h>
+#endif
+#elif defined(__ARM_NEON) || defined(__ARM_NEON__) || defined(__aarch64__)
+#include <arm_neon.h>
+#endif
+
 namespace tinyann {
 
 /// Predicate for filtered search: return true if `id` is eligible.
@@ -36,10 +47,232 @@ struct SearchResult {
 };
 
 // ---------------------------------------------------------------------------
-// Shared metric helpers (used by exact Index and HnswIndex)
+// SIMD distance kernels (compile-time backend selection)
+// Priority: AVX2 → SSE2 → ARM NEON → scalar
 // ---------------------------------------------------------------------------
 
-inline bool higher_is_better(Metric m) noexcept { return m != Metric::Euclidean; }
+namespace simd {
+
+#if defined(__AVX2__)
+
+inline float hsum256(__m256 v) {
+    __m128 lo = _mm256_castps256_ps128(v);
+    __m128 hi = _mm256_extractf128_ps(v, 1);
+    __m128 s = _mm_add_ps(lo, hi);
+    s = _mm_hadd_ps(s, s);
+    s = _mm_hadd_ps(s, s);
+    return _mm_cvtss_f32(s);
+}
+
+inline float inner_product(const float* a, const float* b, std::size_t dim) {
+    __m256 vacc = _mm256_setzero_ps();
+    std::size_t i = 0;
+    for (; i + 8 <= dim; i += 8) {
+        const __m256 va = _mm256_loadu_ps(a + i);
+        const __m256 vb = _mm256_loadu_ps(b + i);
+        vacc = _mm256_fmadd_ps(va, vb, vacc);
+    }
+    float sum = hsum256(vacc);
+    for (; i < dim; ++i) {
+        sum += a[i] * b[i];
+    }
+    return sum;
+}
+
+inline float squared_l2(const float* a, const float* b, std::size_t dim) {
+    __m256 vacc = _mm256_setzero_ps();
+    std::size_t i = 0;
+    for (; i + 8 <= dim; i += 8) {
+        const __m256 va = _mm256_loadu_ps(a + i);
+        const __m256 vb = _mm256_loadu_ps(b + i);
+        const __m256 vd = _mm256_sub_ps(va, vb);
+        vacc = _mm256_fmadd_ps(vd, vd, vacc);
+    }
+    float sum = hsum256(vacc);
+    for (; i < dim; ++i) {
+        const float d = a[i] - b[i];
+        sum += d * d;
+    }
+    return sum;
+}
+
+inline void cosine_parts(const float* a, const float* b, std::size_t dim, float& dot, float& na,
+                         float& nb) {
+    __m256 vdot = _mm256_setzero_ps();
+    __m256 vna = _mm256_setzero_ps();
+    __m256 vnb = _mm256_setzero_ps();
+    std::size_t i = 0;
+    for (; i + 8 <= dim; i += 8) {
+        const __m256 va = _mm256_loadu_ps(a + i);
+        const __m256 vb = _mm256_loadu_ps(b + i);
+        vdot = _mm256_fmadd_ps(va, vb, vdot);
+        vna = _mm256_fmadd_ps(va, va, vna);
+        vnb = _mm256_fmadd_ps(vb, vb, vnb);
+    }
+    dot = hsum256(vdot);
+    na = hsum256(vna);
+    nb = hsum256(vnb);
+    for (; i < dim; ++i) {
+        dot += a[i] * b[i];
+        na += a[i] * a[i];
+        nb += b[i] * b[i];
+    }
+}
+
+inline const char* backend_name() { return "avx2"; }
+
+#elif defined(__SSE2__) || defined(_M_X64) || defined(_M_AMD64)
+
+// Pure SSE2 horizontal sum of 4 floats.
+inline float hsum128_sse2(__m128 v) {
+    __m128 shuf = _mm_shuffle_ps(v, v, _MM_SHUFFLE(2, 3, 0, 1));
+    __m128 sums = _mm_add_ps(v, shuf);
+    shuf = _mm_movehl_ps(shuf, sums);
+    sums = _mm_add_ss(sums, shuf);
+    return _mm_cvtss_f32(sums);
+}
+
+inline float inner_product(const float* a, const float* b, std::size_t dim) {
+    __m128 vacc = _mm_setzero_ps();
+    std::size_t i = 0;
+    for (; i + 4 <= dim; i += 4) {
+        const __m128 va = _mm_loadu_ps(a + i);
+        const __m128 vb = _mm_loadu_ps(b + i);
+#if defined(__FMA__)
+        vacc = _mm_fmadd_ps(va, vb, vacc);
+#else
+        vacc = _mm_add_ps(vacc, _mm_mul_ps(va, vb));
+#endif
+    }
+    float sum = hsum128_sse2(vacc);
+    for (; i < dim; ++i) {
+        sum += a[i] * b[i];
+    }
+    return sum;
+}
+
+inline float squared_l2(const float* a, const float* b, std::size_t dim) {
+    __m128 vacc = _mm_setzero_ps();
+    std::size_t i = 0;
+    for (; i + 4 <= dim; i += 4) {
+        const __m128 va = _mm_loadu_ps(a + i);
+        const __m128 vb = _mm_loadu_ps(b + i);
+        const __m128 vd = _mm_sub_ps(va, vb);
+#if defined(__FMA__)
+        vacc = _mm_fmadd_ps(vd, vd, vacc);
+#else
+        vacc = _mm_add_ps(vacc, _mm_mul_ps(vd, vd));
+#endif
+    }
+    float sum = hsum128_sse2(vacc);
+    for (; i < dim; ++i) {
+        const float d = a[i] - b[i];
+        sum += d * d;
+    }
+    return sum;
+}
+
+inline void cosine_parts(const float* a, const float* b, std::size_t dim, float& dot, float& na,
+                         float& nb) {
+    __m128 vdot = _mm_setzero_ps();
+    __m128 vna = _mm_setzero_ps();
+    __m128 vnb = _mm_setzero_ps();
+    std::size_t i = 0;
+    for (; i + 4 <= dim; i += 4) {
+        const __m128 va = _mm_loadu_ps(a + i);
+        const __m128 vb = _mm_loadu_ps(b + i);
+#if defined(__FMA__)
+        vdot = _mm_fmadd_ps(va, vb, vdot);
+        vna = _mm_fmadd_ps(va, va, vna);
+        vnb = _mm_fmadd_ps(vb, vb, vnb);
+#else
+        vdot = _mm_add_ps(vdot, _mm_mul_ps(va, vb));
+        vna = _mm_add_ps(vna, _mm_mul_ps(va, va));
+        vnb = _mm_add_ps(vnb, _mm_mul_ps(vb, vb));
+#endif
+    }
+    dot = hsum128_sse2(vdot);
+    na = hsum128_sse2(vna);
+    nb = hsum128_sse2(vnb);
+    for (; i < dim; ++i) {
+        dot += a[i] * b[i];
+        na += a[i] * a[i];
+        nb += b[i] * b[i];
+    }
+}
+
+inline const char* backend_name() { return "sse2"; }
+
+#elif defined(__ARM_NEON) || defined(__ARM_NEON__) || defined(__aarch64__)
+
+inline float hsum128_neon(float32x4_t v) {
+#if defined(__aarch64__)
+    return vaddvq_f32(v);
+#else
+    float32x2_t s = vadd_f32(vget_low_f32(v), vget_high_f32(v));
+    s = vpadd_f32(s, s);
+    return vget_lane_f32(s, 0);
+#endif
+}
+
+inline float inner_product(const float* a, const float* b, std::size_t dim) {
+    float32x4_t vacc = vdupq_n_f32(0.f);
+    std::size_t i = 0;
+    for (; i + 4 <= dim; i += 4) {
+        const float32x4_t va = vld1q_f32(a + i);
+        const float32x4_t vb = vld1q_f32(b + i);
+        vacc = vmlaq_f32(vacc, va, vb);
+    }
+    float sum = hsum128_neon(vacc);
+    for (; i < dim; ++i) {
+        sum += a[i] * b[i];
+    }
+    return sum;
+}
+
+inline float squared_l2(const float* a, const float* b, std::size_t dim) {
+    float32x4_t vacc = vdupq_n_f32(0.f);
+    std::size_t i = 0;
+    for (; i + 4 <= dim; i += 4) {
+        const float32x4_t va = vld1q_f32(a + i);
+        const float32x4_t vb = vld1q_f32(b + i);
+        const float32x4_t vd = vsubq_f32(va, vb);
+        vacc = vmlaq_f32(vacc, vd, vd);
+    }
+    float sum = hsum128_neon(vacc);
+    for (; i < dim; ++i) {
+        const float d = a[i] - b[i];
+        sum += d * d;
+    }
+    return sum;
+}
+
+inline void cosine_parts(const float* a, const float* b, std::size_t dim, float& dot, float& na,
+                         float& nb) {
+    float32x4_t vdot = vdupq_n_f32(0.f);
+    float32x4_t vna = vdupq_n_f32(0.f);
+    float32x4_t vnb = vdupq_n_f32(0.f);
+    std::size_t i = 0;
+    for (; i + 4 <= dim; i += 4) {
+        const float32x4_t va = vld1q_f32(a + i);
+        const float32x4_t vb = vld1q_f32(b + i);
+        vdot = vmlaq_f32(vdot, va, vb);
+        vna = vmlaq_f32(vna, va, va);
+        vnb = vmlaq_f32(vnb, vb, vb);
+    }
+    dot = hsum128_neon(vdot);
+    na = hsum128_neon(vna);
+    nb = hsum128_neon(vnb);
+    for (; i < dim; ++i) {
+        dot += a[i] * b[i];
+        na += a[i] * a[i];
+        nb += b[i] * b[i];
+    }
+}
+
+inline const char* backend_name() { return "neon"; }
+
+#else
 
 inline float inner_product(const float* a, const float* b, std::size_t dim) {
     float sum = 0.f;
@@ -49,13 +282,48 @@ inline float inner_product(const float* a, const float* b, std::size_t dim) {
     return sum;
 }
 
-inline float euclidean_distance(const float* a, const float* b, std::size_t dim) {
+inline float squared_l2(const float* a, const float* b, std::size_t dim) {
     float sum = 0.f;
     for (std::size_t i = 0; i < dim; ++i) {
         const float d = a[i] - b[i];
         sum += d * d;
     }
-    return std::sqrt(sum);
+    return sum;
+}
+
+inline void cosine_parts(const float* a, const float* b, std::size_t dim, float& dot, float& na,
+                         float& nb) {
+    dot = 0.f;
+    na = 0.f;
+    nb = 0.f;
+    for (std::size_t i = 0; i < dim; ++i) {
+        dot += a[i] * b[i];
+        na += a[i] * a[i];
+        nb += b[i] * b[i];
+    }
+}
+
+inline const char* backend_name() { return "scalar"; }
+
+#endif
+
+}  // namespace simd
+
+// ---------------------------------------------------------------------------
+// Shared metric helpers (used by exact Index and HnswIndex)
+// ---------------------------------------------------------------------------
+
+inline bool higher_is_better(Metric m) noexcept { return m != Metric::Euclidean; }
+
+/// Active SIMD/scalar backend name ("avx2", "sse2", "neon", or "scalar").
+inline const char* distance_backend() { return simd::backend_name(); }
+
+inline float inner_product(const float* a, const float* b, std::size_t dim) {
+    return simd::inner_product(a, b, dim);
+}
+
+inline float euclidean_distance(const float* a, const float* b, std::size_t dim) {
+    return std::sqrt(simd::squared_l2(a, b, dim));
 }
 
 /// Cosine similarity. Zero-norm on either side yields 0 (safe default).
@@ -63,11 +331,7 @@ inline float cosine_similarity(const float* a, const float* b, std::size_t dim) 
     float dot = 0.f;
     float na = 0.f;
     float nb = 0.f;
-    for (std::size_t i = 0; i < dim; ++i) {
-        dot += a[i] * b[i];
-        na += a[i] * a[i];
-        nb += b[i] * b[i];
-    }
+    simd::cosine_parts(a, b, dim, dot, na, nb);
     if (na == 0.f || nb == 0.f) {
         return 0.f;
     }

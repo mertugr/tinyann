@@ -1,6 +1,7 @@
 # tinyann
 
 Small **C++17** in-memory vector similarity search library with a CLI.
+Distance kernels use **SIMD** when available (AVX2 / SSE2 / ARM NEON, with scalar fallback).
 
 ## Features
 
@@ -34,9 +35,12 @@ HNSW trades a modest amount of RAM (graph links) and build time for high recall 
 
 ```bash
 cmake -S . -B build -DCMAKE_BUILD_TYPE=Release
+# Optional on x86: -DTINYANN_ENABLE_AVX2=ON (default ON) for AVX2+FMA kernels
 cmake --build build
 ctest --test-dir build --output-on-failure
 ```
+
+Active backend is reported as `distance_backend=neon|avx2|sse2|scalar` (CLI stderr / tests).
 
 Artifacts:
 
