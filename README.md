@@ -16,7 +16,8 @@ Small **C++17** in-memory vector similarity search library with a CLI.
 - CLI to load vectors from a text file and run queries (`--index exact|hnsw`, optional `--recall`)
 - **Binary persistence**: `Index::save` / `Index::load` and `HnswIndex::save` / `HnswIndex::load` (HNSW stores the full graph); CLI `--save` / `--load`
 - **`remove(id)` / `update(id, vector)` / `contains(id)`** on both indexes; HNSW hard-deletes unlink nodes, remap indices, and reassign the entry point so the graph stays searchable
-- Unit tests (CTest), including random-data recall@10 checks, save/load byte-identical search, and remove/update
+- **Filtered search** `search(query, k, predicate)` — only ids with `predicate(id) == true`; HNSW applies the filter during graph search (not post-filter of top‑k). CLI: `--allow-ids FILE`
+- Unit tests (CTest), including random-data recall@10 checks, save/load byte-identical search, remove/update, and filtered search
 
 ## Why HNSW (not IVF)?
 
@@ -77,6 +78,10 @@ exact.remove(42);
 exact.update(7, new_vector);
 hnsw.remove(42);   // unlinks node, keeps graph searchable; reassigns entry if needed
 hnsw.update(7, new_vector);
+
+// Filtered search (eligible ids only; HNSW keeps exploring under the filter)
+auto hits = index.search(query, 10, [](std::int64_t id) { return id % 2 == 0; });
+auto ahits = hnsw.search(query, 10, /*ef=*/64, [](std::int64_t id) { return id > 0; });
 ```
 
 Header-only: link the `tinyann` CMake interface target (or add `include/`).
@@ -103,6 +108,10 @@ Header-only: link the `tinyann` CMake interface target (or add `include/`).
   --index hnsw --save /tmp/hnsw.tann
 ./build/tinyann --load /tmp/hnsw.tann --index hnsw \
   --query data/query.txt --k 3
+
+# Filtered search: only ids listed in allow file (one int64 per line)
+./build/tinyann --dim 3 --metric cosine --vectors data/vectors.txt \
+  --query data/query.txt --k 3 --index hnsw --allow-ids data/allow_ids.txt --recall
 ```
 
 Vector file: `<id> <f1> … <fN>` per line (`#` comments / blanks ignored).

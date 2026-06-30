@@ -5,6 +5,7 @@
 #include <iostream>
 #include <sstream>
 #include <string>
+#include <unordered_set>
 #include <vector>
 
 namespace {
@@ -29,6 +30,7 @@ void print_usage(const char* argv0) {
         << "  --efc N           HNSW ef_construction (default: 200)\n"
         << "  --save PATH       Write built/loaded index to PATH (binary)\n"
         << "  --load PATH       Load index from PATH instead of --vectors\n"
+        << "  --allow-ids FILE  Filtered search: only ids listed in FILE (one int64 per line)\n"
         << "  --recall          Also run exact search and print mean recall@k vs exact\n"
         << "  -h, --help        Show this help\n\n"
         << "Output (per query): one line per hit: <rank>\\t<id>\\t<score>\n";
@@ -46,6 +48,7 @@ struct Options {
     std::size_t efc = 200;
     std::string save_path;
     std::string load_path;
+    std::string allow_ids_path;
     bool measure_recall = false;
     bool help = false;
 };
@@ -108,6 +111,10 @@ bool parse_args(int argc, char** argv, Options& opt) {
             const char* v = need("--load");
             if (!v) return false;
             opt.load_path = v;
+        } else if (arg == "--allow-ids") {
+            const char* v = need("--allow-ids");
+            if (!v) return false;
+            opt.allow_ids_path = v;
         } else if (arg == "--recall") {
             opt.measure_recall = true;
         } else {
@@ -218,6 +225,28 @@ void print_hits(const std::vector<tinyann::SearchResult>& results) {
     }
 }
 
+bool load_id_set(const std::string& path, std::unordered_set<std::int64_t>& out) {
+    std::ifstream in(path);
+    if (!in) {
+        std::cerr << "failed to open allow-ids file: " << path << "\n";
+        return false;
+    }
+    std::string line;
+    while (std::getline(in, line)) {
+        if (line.empty() || line[0] == '#') {
+            continue;
+        }
+        std::istringstream iss(line);
+        std::int64_t id = 0;
+        if (!(iss >> id)) {
+            std::cerr << "bad id line in " << path << ": " << line << "\n";
+            return false;
+        }
+        out.insert(id);
+    }
+    return true;
+}
+
 }  // namespace
 
 int main(int argc, char** argv) {
@@ -265,6 +294,17 @@ int main(int argc, char** argv) {
     }
 
     try {
+        std::unordered_set<std::int64_t> allow_ids;
+        const bool filtered = !opt.allow_ids_path.empty();
+        if (filtered) {
+            if (!load_id_set(opt.allow_ids_path, allow_ids)) {
+                return 1;
+            }
+            std::cerr << "filter=allow-ids count=" << allow_ids.size() << " from "
+                      << opt.allow_ids_path << "\n";
+        }
+        auto pred = [&](std::int64_t id) { return !filtered || allow_ids.count(id) > 0; };
+
         const bool approx = use_hnsw(opt.index_type);
 
         if (!approx) {
@@ -290,7 +330,7 @@ int main(int argc, char** argv) {
 
             std::cerr << "index=exact size=" << index.size() << " dim=" << index.dimension()
                       << " metric=" << tinyann::metric_name(index.metric()) << " k=" << opt.k
-                      << "\n";
+                      << (filtered ? " filtered=1" : "") << "\n";
 
             if (!opt.query_path.empty()) {
                 std::vector<std::vector<float>> queries;
@@ -301,7 +341,11 @@ int main(int argc, char** argv) {
                     if (queries.size() > 1) {
                         std::cout << "# query " << qi << "\n";
                     }
-                    print_hits(index.search(queries[qi], opt.k));
+                    if (filtered) {
+                        print_hits(index.search(queries[qi], opt.k, pred));
+                    } else {
+                        print_hits(index.search(queries[qi], opt.k));
+                    }
                 }
             }
             return 0;
@@ -347,7 +391,8 @@ int main(int argc, char** argv) {
         std::cerr << "index=hnsw size=" << hnsw.size() << " dim=" << hnsw.dimension()
                   << " metric=" << tinyann::metric_name(hnsw.metric()) << " k=" << opt.k
                   << " M=" << hnsw.params().M << " ef=" << hnsw.params().ef_search
-                  << " efc=" << hnsw.params().ef_construction << "\n";
+                  << " efc=" << hnsw.params().ef_construction
+                  << (filtered ? " filtered=1" : "") << "\n";
 
         if (!opt.query_path.empty()) {
             std::vector<std::vector<float>> queries;
@@ -358,13 +403,22 @@ int main(int argc, char** argv) {
                 if (queries.size() > 1) {
                     std::cout << "# query " << qi << "\n";
                 }
-                print_hits(hnsw.search(queries[qi], opt.k, hnsw.params().ef_search));
+                if (filtered) {
+                    print_hits(hnsw.search(queries[qi], opt.k, hnsw.params().ef_search, pred));
+                } else {
+                    print_hits(hnsw.search(queries[qi], opt.k, hnsw.params().ef_search));
+                }
             }
 
             if (opt.measure_recall) {
                 if (!have_exact) {
                     std::cerr << "--recall with --load requires rebuilding exact from --vectors; "
                                  "skipping recall\n";
+                } else if (filtered) {
+                    const double rec = hnsw.recall_at_k_vs(exact_for_recall, queries, opt.k, pred,
+                                                           hnsw.params().ef_search);
+                    std::cerr << "recall@" << opt.k << "=" << rec
+                              << " (filtered vs exact, " << queries.size() << " queries)\n";
                 } else {
                     const double rec =
                         hnsw.recall_at_k_vs(exact_for_recall, queries, opt.k, hnsw.params().ef_search);
