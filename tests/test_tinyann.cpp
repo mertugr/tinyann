@@ -201,6 +201,65 @@ void test_score_helpers() {
     CHECK_NEAR(ip.score({1.f, 2.f}, {3.f, 4.f}), 11.0, 1e-5);
 }
 
+// Scalar reference kernels (for SIMD correctness checks).
+float scalar_ip(const float* a, const float* b, std::size_t dim) {
+    float s = 0.f;
+    for (std::size_t i = 0; i < dim; ++i) {
+        s += a[i] * b[i];
+    }
+    return s;
+}
+
+float scalar_l2(const float* a, const float* b, std::size_t dim) {
+    float s = 0.f;
+    for (std::size_t i = 0; i < dim; ++i) {
+        const float d = a[i] - b[i];
+        s += d * d;
+    }
+    return std::sqrt(s);
+}
+
+float scalar_cosine(const float* a, const float* b, std::size_t dim) {
+    float dot = 0.f, na = 0.f, nb = 0.f;
+    for (std::size_t i = 0; i < dim; ++i) {
+        dot += a[i] * b[i];
+        na += a[i] * a[i];
+        nb += b[i] * b[i];
+    }
+    if (na == 0.f || nb == 0.f) {
+        return 0.f;
+    }
+    return dot / (std::sqrt(na) * std::sqrt(nb));
+}
+
+void test_simd_matches_scalar() {
+    std::cout << "distance_backend=" << tinyann::distance_backend() << "\n";
+    // Exercise multiple dimensions including non-multiples of 4/8 (tail loops).
+    const std::size_t dims[] = {1, 2, 3, 4, 5, 7, 8, 9, 15, 16, 17, 31, 32, 33, 64, 127, 128, 256};
+    std::mt19937_64 rng(2026);
+    std::normal_distribution<float> nd(0.f, 1.f);
+
+    for (std::size_t dim : dims) {
+        std::vector<float> a(dim), b(dim);
+        for (std::size_t i = 0; i < dim; ++i) {
+            a[i] = nd(rng);
+            b[i] = nd(rng);
+        }
+        CHECK_NEAR(tinyann::inner_product(a.data(), b.data(), dim), scalar_ip(a.data(), b.data(), dim),
+                   1e-4 * static_cast<double>(dim));
+        CHECK_NEAR(tinyann::euclidean_distance(a.data(), b.data(), dim),
+                   scalar_l2(a.data(), b.data(), dim), 1e-4 * std::sqrt(static_cast<double>(dim)));
+        CHECK_NEAR(tinyann::cosine_similarity(a.data(), b.data(), dim),
+                   scalar_cosine(a.data(), b.data(), dim), 1e-4);
+
+        // Zero vector cosine
+        std::vector<float> z(dim, 0.f);
+        CHECK_NEAR(tinyann::cosine_similarity(z.data(), a.data(), dim), 0.0, 1e-6);
+        CHECK_NEAR(tinyann::cosine_similarity(a.data(), z.data(), dim), 0.0, 1e-6);
+        CHECK_NEAR(tinyann::euclidean_distance(a.data(), a.data(), dim), 0.0, 1e-5);
+    }
+}
+
 void test_parse_metric() {
     CHECK(tinyann::Index::parse_metric("cosine") == tinyann::Metric::Cosine);
     CHECK(tinyann::Index::parse_metric("cos") == tinyann::Metric::Cosine);
@@ -922,6 +981,7 @@ int main() {
     test_euclidean_zero_vectors();
     test_inner_product_zero_vectors();
     test_score_helpers();
+    test_simd_matches_scalar();
     test_parse_metric();
     test_metric_name();
     test_duplicate_ids_kept();

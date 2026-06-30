@@ -13,6 +13,26 @@ target_include_directories(tinyann INTERFACE
     $<INSTALL_INTERFACE:include>
 )
 
+# Optional AVX2 on x86/x64 (SSE2 is assumed on x86-64; NEON on AArch64 is baseline).
+option(TINYANN_ENABLE_AVX2 "Compile with AVX2+FMA distance kernels on x86" ON)
+include(CheckCXXCompilerFlag)
+if(TINYANN_ENABLE_AVX2)
+  if(CMAKE_SYSTEM_PROCESSOR MATCHES "x86_64|AMD64|i.86|x86")
+    if(MSVC)
+      target_compile_options(tinyann INTERFACE /arch:AVX2)
+    else()
+      check_cxx_compiler_flag("-mavx2" TINYANN_HAS_MAVX2)
+      check_cxx_compiler_flag("-mfma" TINYANN_HAS_MFMA)
+      if(TINYANN_HAS_MAVX2)
+        target_compile_options(tinyann INTERFACE -mavx2)
+      endif()
+      if(TINYANN_HAS_MFMA)
+        target_compile_options(tinyann INTERFACE -mfma)
+      endif()
+    endif()
+  endif()
+endif()
+
 # CLI executable
 add_executable(tinyann_cli src/cli.cpp)
 target_link_libraries(tinyann_cli PRIVATE tinyann)

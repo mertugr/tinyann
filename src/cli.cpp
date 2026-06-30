@@ -267,6 +267,9 @@ int main(int argc, char** argv) {
         return opt.help ? 0 : 2;
     }
 
+    // Always print distance backend once for transparency (stderr).
+    std::cerr << "distance_backend=" << tinyann::distance_backend() << "\n";
+
     if (!use_hnsw(opt.index_type) && !use_exact(opt.index_type)) {
         std::cerr << "unknown --index type: " << opt.index_type
                   << " (use exact|brute|hnsw|approx)\n";
