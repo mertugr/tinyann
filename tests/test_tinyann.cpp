@@ -1947,6 +1947,35 @@ void test_ivfpq_refine_improves_recall() {
     CHECK(threw);
 }
 
+/// Build unit vectors with strong axis-aligned correlation (second half = first half).
+/// Axis-aligned PQ wastes capacity here; OPQ should help.
+std::vector<std::vector<float>> make_correlated_unit_corpus(std::size_t dim, std::size_t n,
+                                                            std::mt19937_64& rng) {
+    std::vector<std::vector<float>> all;
+    all.reserve(n);
+    const std::size_t half = dim / 2;
+    for (std::size_t i = 0; i < n; ++i) {
+        auto v = random_unit_vector(half, rng);
+        std::vector<float> full(dim);
+        for (std::size_t d = 0; d < half; ++d) {
+            full[d] = v[d];
+            full[d + half] = v[d];
+        }
+        float n2 = 0.f;
+        for (float x : full) {
+            n2 += x * x;
+        }
+        if (n2 > 0.f) {
+            const float inv = 1.f / std::sqrt(n2);
+            for (float& x : full) {
+                x *= inv;
+            }
+        }
+        all.push_back(std::move(full));
+    }
+    return all;
+}
+
 void test_ivfpq_opq_basic_and_save_load() {
     const std::size_t dim = 32;
     tinyann::IvfPqParams p;
@@ -1961,28 +1990,7 @@ void test_ivfpq_opq_basic_and_save_load() {
 
     tinyann::IvfPqIndex idx(dim, tinyann::Metric::InnerProduct, p);
     std::mt19937_64 rng(11);
-    // Correlated dimensions: second half copies first half (axis-aligned PQ is weak).
-    std::vector<std::vector<float>> all;
-    for (int i = 0; i < 300; ++i) {
-        auto v = random_unit_vector(dim / 2, rng);
-        std::vector<float> full(dim);
-        for (std::size_t d = 0; d < dim / 2; ++d) {
-            full[d] = v[d];
-            full[d + dim / 2] = v[d];
-        }
-        // renorm
-        float n2 = 0.f;
-        for (float x : full) {
-            n2 += x * x;
-        }
-        if (n2 > 0.f) {
-            const float inv = 1.f / std::sqrt(n2);
-            for (float& x : full) {
-                x *= inv;
-            }
-        }
-        all.push_back(std::move(full));
-    }
+    auto all = make_correlated_unit_corpus(dim, 300, rng);
     idx.train(all);
     CHECK(idx.uses_opq());
     CHECK(idx.opq_matrix().size() == dim * dim);
@@ -2007,6 +2015,66 @@ void test_ivfpq_opq_basic_and_save_load() {
     CHECK(!plain.uses_opq());
     plain.add(0, all[0]);
     CHECK(!plain.search(all[0], 1).empty());
+}
+
+void test_ivfpq_opq_better_than_pq() {
+    // On correlated embeddings, OPQ should not lose to plain PQ and should usually win.
+    const std::size_t dim = 64;
+    const std::size_t n = 2500;
+    const std::size_t nq = 60;
+    const std::size_t k = 10;
+
+    tinyann::IvfPqParams base;
+    base.nlist = 40;
+    base.nprobe = 16;
+    base.M = 8;  // coarser codes so rotation can matter
+    base.kmeans_iters = 20;
+    base.pq_kmeans_iters = 20;
+    base.seed = 99;
+    base.opq_iters = 8;
+
+    std::mt19937_64 rng(2026);
+    auto all = make_correlated_unit_corpus(dim, n, rng);
+    std::vector<std::vector<float>> queries;
+    queries.reserve(nq);
+    for (std::size_t i = 0; i < nq; ++i) {
+        // Same correlation structure for queries.
+        auto batch = make_correlated_unit_corpus(dim, 1, rng);
+        queries.push_back(std::move(batch[0]));
+    }
+
+    tinyann::Index exact(dim, tinyann::Metric::InnerProduct);
+    for (std::size_t i = 0; i < n; ++i) {
+        exact.add(static_cast<std::int64_t>(i), all[i]);
+    }
+
+    tinyann::IvfPqParams p_pq = base;
+    p_pq.use_opq = false;
+    tinyann::IvfPqIndex pq(dim, tinyann::Metric::InnerProduct, p_pq);
+    pq.train(all);
+    for (std::size_t i = 0; i < n; ++i) {
+        pq.add(static_cast<std::int64_t>(i), all[i]);
+    }
+    CHECK(!pq.uses_opq());
+
+    tinyann::IvfPqParams p_opq = base;
+    p_opq.use_opq = true;
+    tinyann::IvfPqIndex opq(dim, tinyann::Metric::InnerProduct, p_opq);
+    opq.train(all);
+    for (std::size_t i = 0; i < n; ++i) {
+        opq.add(static_cast<std::int64_t>(i), all[i]);
+    }
+    CHECK(opq.uses_opq());
+
+    const double rec_pq = pq.recall_at_k_vs(exact, queries, k);
+    const double rec_opq = opq.recall_at_k_vs(exact, queries, k);
+    std::cout << "recall@10[ivfpq_pq]=" << rec_pq << " opq=" << rec_opq << "\n";
+
+    // OPQ must not be worse than plain PQ on this correlated set (allow tiny float noise).
+    CHECK(rec_opq + 1e-9 >= rec_pq);
+    // Expect a real gain when axes are highly redundant.
+    CHECK(rec_opq > rec_pq + 0.02);
+    CHECK(rec_opq > 0.45);
 }
 
 void test_ivfpq_remove_update() {
@@ -2135,6 +2203,7 @@ int main() {
     test_ivfpq_save_load();
     test_ivfpq_refine_improves_recall();
     test_ivfpq_opq_basic_and_save_load();
+    test_ivfpq_opq_better_than_pq();
     test_ivfpq_remove_update();
     test_sq_quantize_dequantize();
     test_index_sq_search_and_recall();

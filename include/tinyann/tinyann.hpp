@@ -3330,78 +3330,15 @@ private:
         }
     }
 
-    /// Orthogonal Procrustes: R = U Vᵀ from SVD of M (d×d), via Jacobi on M Mᵀ.
-    void procrustes_update_R(const std::vector<float>& X, const std::vector<float>& Y,
-                             std::size_t nt) {
-        // M = Y * Xᵀ  (d x d), X/Y row-major nt * d
-        const std::size_t d = dimension_;
-        std::vector<float> M(d * d, 0.f);
-        for (std::size_t i = 0; i < nt; ++i) {
-            const float* xi = X.data() + i * d;
-            const float* yi = Y.data() + i * d;
-            for (std::size_t a = 0; a < d; ++a) {
-                for (std::size_t b = 0; b < d; ++b) {
-                    M[a * d + b] += yi[a] * xi[b];
-                }
-            }
-        }
-        // SVD M = U S Vᵀ using Jacobi on A = M Mᵀ (left singular vectors U),
-        // then V columns from Mᵀ u / σ.
-        std::vector<float> A(d * d, 0.f);
-        for (std::size_t i = 0; i < d; ++i) {
-            for (std::size_t j = 0; j < d; ++j) {
-                float s = 0.f;
-                for (std::size_t k = 0; k < d; ++k) {
-                    s += M[i * d + k] * M[j * d + k];
-                }
-                A[i * d + j] = s;
-            }
-        }
-        std::vector<float> U(d * d, 0.f);
-        std::vector<float> evals(d, 0.f);
-        jacobi_eigen_symmetric(A, U, evals, d);
-
-        std::vector<float> V(d * d, 0.f);
-        for (std::size_t j = 0; j < d; ++j) {
-            // v_j proportional to Mᵀ u_j
-            std::vector<float> v(d, 0.f);
-            for (std::size_t i = 0; i < d; ++i) {
-                float s = 0.f;
-                for (std::size_t k = 0; k < d; ++k) {
-                    s += M[k * d + i] * U[k * d + j];
-                }
-                v[i] = s;
-            }
-            float n2 = 0.f;
-            for (std::size_t i = 0; i < d; ++i) {
-                n2 += v[i] * v[i];
-            }
-            const float inv = (n2 > 1e-20f) ? (1.f / std::sqrt(n2)) : 0.f;
-            for (std::size_t i = 0; i < d; ++i) {
-                V[i * d + j] = v[i] * inv;  // store V as columns in row-major: V[i][j]
-            }
-        }
-        // R = U Vᵀ  => R[i][j] = sum_k U[i][k] V[j][k]
-        opq_R_.assign(d * d, 0.f);
-        for (std::size_t i = 0; i < d; ++i) {
-            for (std::size_t j = 0; j < d; ++j) {
-                float s = 0.f;
-                for (std::size_t k = 0; k < d; ++k) {
-                    s += U[i * d + k] * V[j * d + k];
-                }
-                opq_R_[i * d + j] = s;
-            }
-        }
-    }
-
-    /// Jacobi eigenvalue decomposition for symmetric A (destroyed). U columns eigenvectors.
+    /// Jacobi eigenvalue decomposition for symmetric A (destroyed).
+    /// On exit, U has orthonormal columns (eigenvectors), evals the eigenvalues.
     static void jacobi_eigen_symmetric(std::vector<float>& A, std::vector<float>& U,
                                        std::vector<float>& evals, std::size_t n) {
         U.assign(n * n, 0.f);
         for (std::size_t i = 0; i < n; ++i) {
             U[i * n + i] = 1.f;
         }
-        const int max_sweeps = 40;
+        const int max_sweeps = 50;
         for (int sweep = 0; sweep < max_sweeps; ++sweep) {
             float off = 0.f;
             for (std::size_t p = 0; p < n; ++p) {
@@ -3409,7 +3346,7 @@ private:
                     off += std::fabs(A[p * n + q]);
                 }
             }
-            if (off < 1e-8f * static_cast<float>(n)) {
+            if (off < 1e-10f * static_cast<float>(n)) {
                 break;
             }
             for (std::size_t p = 0; p < n; ++p) {
@@ -3417,7 +3354,7 @@ private:
                     const float app = A[p * n + p];
                     const float aqq = A[q * n + q];
                     const float apq = A[p * n + q];
-                    if (std::fabs(apq) < 1e-12f) {
+                    if (std::fabs(apq) < 1e-14f) {
                         continue;
                     }
                     const float tau = (aqq - app) / (2.f * apq);
@@ -3427,7 +3364,6 @@ private:
                             : (-1.f / (-tau + std::sqrt(1.f + tau * tau)));
                     const float c = 1.f / std::sqrt(1.f + t * t);
                     const float s = t * c;
-                    // Rotate A
                     for (std::size_t r = 0; r < n; ++r) {
                         if (r == p || r == q) {
                             continue;
@@ -3440,7 +3376,6 @@ private:
                     A[p * n + p] = app - t * apq;
                     A[q * n + q] = aqq + t * apq;
                     A[p * n + q] = A[q * n + p] = 0.f;
-                    // Accumulate U
                     for (std::size_t r = 0; r < n; ++r) {
                         const float urp = U[r * n + p];
                         const float urq = U[r * n + q];
@@ -3455,6 +3390,107 @@ private:
         }
     }
 
+    /// Set R so y = R x projects residuals onto principal axes of residual covariance
+    /// (PCA rotation — standard OPQ initialization / strong baseline for subspace PQ).
+    void learn_opq_rotation_pca(const std::vector<float>& residuals, std::size_t nt) {
+        const std::size_t d = dimension_;
+        std::vector<float> cov(d * d, 0.f);
+        for (std::size_t i = 0; i < nt; ++i) {
+            const float* x = residuals.data() + i * d;
+            for (std::size_t a = 0; a < d; ++a) {
+                for (std::size_t b = 0; b < d; ++b) {
+                    cov[a * d + b] += x[a] * x[b];
+                }
+            }
+        }
+        const float inv_n = 1.f / static_cast<float>(std::max<std::size_t>(nt, 1));
+        for (float& c : cov) {
+            c *= inv_n;
+        }
+        std::vector<float> U(d * d, 0.f);
+        std::vector<float> evals(d, 0.f);
+        jacobi_eigen_symmetric(cov, U, evals, d);
+
+        // Sort eigenvectors by eigenvalue descending (column permutation of U).
+        std::vector<std::size_t> order(d);
+        for (std::size_t i = 0; i < d; ++i) {
+            order[i] = i;
+        }
+        std::sort(order.begin(), order.end(),
+                  [&](std::size_t a, std::size_t b) { return evals[a] > evals[b]; });
+
+        // R = U_sorted^T  => rows of R are principal axes (y = R x).
+        opq_R_.assign(d * d, 0.f);
+        for (std::size_t new_axis = 0; new_axis < d; ++new_axis) {
+            const std::size_t old_col = order[new_axis];
+            for (std::size_t j = 0; j < d; ++j) {
+                opq_R_[new_axis * d + j] = U[j * d + old_col];
+            }
+        }
+    }
+
+    /// One Procrustes step: R ← argmin ||R X − Y||_F with Y = PQ recon of R_old X.
+    void procrustes_update_R(const std::vector<float>& X, const std::vector<float>& Y,
+                             std::size_t nt) {
+        const std::size_t d = dimension_;
+        // M = Y^T?  For columns: minimize ||R X - Y|| with X,Y as d×n.
+        // Optimal R = U V^T from SVD(Y X^T). Row storage: M[a,b]=Σ_i Y[i,a] X[i,b].
+        std::vector<float> M(d * d, 0.f);
+        for (std::size_t i = 0; i < nt; ++i) {
+            const float* xi = X.data() + i * d;
+            const float* yi = Y.data() + i * d;
+            for (std::size_t a = 0; a < d; ++a) {
+                for (std::size_t b = 0; b < d; ++b) {
+                    M[a * d + b] += yi[a] * xi[b];
+                }
+            }
+        }
+        // SVD via eigen of M M^T and M^T M
+        std::vector<float> MMt(d * d, 0.f);
+        std::vector<float> MtM(d * d, 0.f);
+        for (std::size_t i = 0; i < d; ++i) {
+            for (std::size_t j = 0; j < d; ++j) {
+                float s1 = 0.f, s2 = 0.f;
+                for (std::size_t k = 0; k < d; ++k) {
+                    s1 += M[i * d + k] * M[j * d + k];
+                    s2 += M[k * d + i] * M[k * d + j];
+                }
+                MMt[i * d + j] = s1;
+                MtM[i * d + j] = s2;
+            }
+        }
+        std::vector<float> U(d * d), V(d * d), eu(d), ev(d);
+        jacobi_eigen_symmetric(MMt, U, eu, d);
+        jacobi_eigen_symmetric(MtM, V, ev, d);
+        // Align signs: for each singular direction, make U^T M V positive on diagonal-ish.
+        for (std::size_t j = 0; j < d; ++j) {
+            float dot = 0.f;
+            for (std::size_t i = 0; i < d; ++i) {
+                float Mi_dot_v = 0.f;
+                for (std::size_t k = 0; k < d; ++k) {
+                    Mi_dot_v += M[i * d + k] * V[k * d + j];
+                }
+                dot += U[i * d + j] * Mi_dot_v;
+            }
+            if (dot < 0.f) {
+                for (std::size_t i = 0; i < d; ++i) {
+                    U[i * d + j] = -U[i * d + j];
+                }
+            }
+        }
+        // R = U V^T
+        opq_R_.assign(d * d, 0.f);
+        for (std::size_t i = 0; i < d; ++i) {
+            for (std::size_t j = 0; j < d; ++j) {
+                float s = 0.f;
+                for (std::size_t k = 0; k < d; ++k) {
+                    s += U[i * d + k] * V[j * d + k];
+                }
+                opq_R_[i * d + j] = s;
+            }
+        }
+    }
+
     void train_pq_codebooks(const std::vector<std::vector<float>>& training) {
         const std::size_t nt = training.size();
         std::mt19937_64 rng(params_.seed + 1337);
@@ -3463,39 +3499,32 @@ private:
         collect_residuals(training, residuals);
 
         if (!params_.use_opq) {
-            set_identity_opq();
-            // Train PQ directly on residuals (identity rotation).
-            train_pq_on_matrix(residuals, nt, rng);
-            // Clear R storage when not using OPQ to save RAM / mark uses_opq false.
             opq_R_.clear();
+            train_pq_on_matrix(residuals, nt, rng);
             return;
         }
 
-        set_identity_opq();
+        // PCA rotation on residuals (stable OPQ init), then optional Procrustes fine-tunes.
+        learn_opq_rotation_pca(residuals, nt);
         std::vector<float> rotated(nt * dimension_);
         std::vector<float> y_recon(nt * dimension_);
         std::vector<std::uint8_t> code(params_.M);
 
         const std::size_t iters = std::max<std::size_t>(params_.opq_iters, 1);
         for (std::size_t it = 0; it < iters; ++it) {
-            // Y = R * X
             for (std::size_t i = 0; i < nt; ++i) {
                 apply_opq(residuals.data() + i * dimension_, rotated.data() + i * dimension_);
             }
             train_pq_on_matrix(rotated, nt, rng);
-            // Reconstruct in rotated space
+            if (it + 1 == iters) {
+                break;  // final codebooks already trained under current R
+            }
             for (std::size_t i = 0; i < nt; ++i) {
                 encode_pq_space(rotated.data() + i * dimension_, code.data());
                 decode_pq_space(code.data(), y_recon.data() + i * dimension_);
             }
-            // Update R from Procrustes (align R X to Y_recon)
             procrustes_update_R(residuals, y_recon, nt);
         }
-        // Final codebooks on last R
-        for (std::size_t i = 0; i < nt; ++i) {
-            apply_opq(residuals.data() + i * dimension_, rotated.data() + i * dimension_);
-        }
-        train_pq_on_matrix(rotated, nt, rng);
     }
 
     void train_subspace_kmeans(std::size_t m, const std::vector<float>& sub_data, std::size_t nt,
