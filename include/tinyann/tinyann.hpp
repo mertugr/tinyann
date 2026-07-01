@@ -338,6 +338,20 @@ inline float cosine_similarity(const float* a, const float* b, std::size_t dim) 
     return dot / (std::sqrt(na) * std::sqrt(nb));
 }
 
+/// Require every component to be finite (not NaN/Inf). Used by add/update/search.
+inline void require_finite(const float* v, std::size_t dim, const char* what) {
+    for (std::size_t i = 0; i < dim; ++i) {
+        if (!std::isfinite(v[i])) {
+            throw std::invalid_argument(std::string(what) + ": non-finite component at index " +
+                                        std::to_string(i));
+        }
+    }
+}
+
+inline void require_finite(const std::vector<float>& v, const char* what) {
+    require_finite(v.data(), v.size(), what);
+}
+
 /// Metric score as exposed to users (similarity or L2 distance).
 inline float metric_score(Metric m, const float* a, const float* b, std::size_t dim) {
     switch (m) {
@@ -445,9 +459,14 @@ inline double mean_recall_at_k(
 }
 
 // ---------------------------------------------------------------------------
-// Binary persistence helpers (little-endian host; fixed-width types)
+// Binary persistence helpers
 // Format: magic "TANN" | version u32 | kind u32 | ... payload ...
-// kind: 1 = Exact Index, 2 = HnswIndex, 3 = IvfIndex
+// kind: 1 = Exact Index, 2 = HnswIndex, 3 = IvfIndex, 4 = IndexSq
+//
+// Endianness: multi-byte fields are written as raw host memory (native endian).
+// Files are portable only across machines with the **same endianness** (and the
+// same float format). There is no endian marker in the header — do not load a
+// file produced on a different-endian host.
 // ---------------------------------------------------------------------------
 
 namespace detail {
@@ -471,6 +490,25 @@ inline void read_bytes(std::istream& in, void* data, std::size_t n) {
     if (!in || static_cast<std::size_t>(in.gcount()) != n) {
         throw std::runtime_error("tinyann: failed reading from stream (truncated or corrupt)");
     }
+}
+
+/// Multiply `a * b` for allocation/read sizes; throws on overflow (hostile/corrupt files).
+inline std::size_t checked_mul_size(std::size_t a, std::size_t b, const char* what) {
+    if (a == 0 || b == 0) {
+        return 0;
+    }
+    if (a > std::numeric_limits<std::size_t>::max() / b) {
+        throw std::runtime_error(std::string("tinyann: size overflow (") + what + ")");
+    }
+    return a * b;
+}
+
+/// Convert a file `uint64` size field to `size_t`, rejecting values that do not fit.
+inline std::size_t size_from_u64(std::uint64_t v, const char* what) {
+    if (v > static_cast<std::uint64_t>(std::numeric_limits<std::size_t>::max())) {
+        throw std::runtime_error(std::string("tinyann: size does not fit platform (") + what + ")");
+    }
+    return static_cast<std::size_t>(v);
 }
 
 template <typename T>
@@ -536,16 +574,21 @@ inline void write_ids_and_vectors(std::ostream& out, std::size_t dimension, Metr
 inline void read_ids_and_vectors(std::istream& in, std::size_t& dimension, Metric& metric,
                                  std::vector<std::int64_t>& ids, std::vector<float>& data) {
     metric = metric_from_u32(read_pod<std::uint32_t>(in));
-    dimension = static_cast<std::size_t>(read_pod<std::uint64_t>(in));
-    const auto count = static_cast<std::size_t>(read_pod<std::uint64_t>(in));
+    dimension = size_from_u64(read_pod<std::uint64_t>(in), "dimension");
+    const std::size_t count = size_from_u64(read_pod<std::uint64_t>(in), "vector count");
     if (dimension == 0) {
         throw std::runtime_error("tinyann: corrupt file (dimension == 0)");
     }
+    const std::size_t n_floats = checked_mul_size(count, dimension, "count * dimension");
+    const std::size_t ids_bytes =
+        checked_mul_size(count, sizeof(std::int64_t), "count * sizeof(int64)");
+    const std::size_t data_bytes =
+        checked_mul_size(n_floats, sizeof(float), "count * dimension * sizeof(float)");
     ids.resize(count);
-    data.resize(count * dimension);
+    data.resize(n_floats);
     if (count > 0) {
-        read_bytes(in, ids.data(), count * sizeof(std::int64_t));
-        read_bytes(in, data.data(), count * dimension * sizeof(float));
+        read_bytes(in, ids.data(), ids_bytes);
+        read_bytes(in, data.data(), data_bytes);
     }
 }
 
@@ -556,6 +599,10 @@ inline void read_ids_and_vectors(std::istream& in, std::size_t& dimension, Metri
 // ---------------------------------------------------------------------------
 
 /// In-memory exact (brute-force) vector similarity index.
+///
+/// Vectors must be finite (no NaN/Inf). `add` provides the **basic** exception
+/// guarantee only (a throw while growing storage may leave containers partially
+/// updated); it is not strongly exception-safe.
 class Index {
 public:
     explicit Index(std::size_t dimension, Metric metric = Metric::Cosine)
@@ -576,12 +623,14 @@ public:
     std::size_t size() const noexcept { return ids_.size(); }
     bool empty() const noexcept { return ids_.empty(); }
 
+    /// Append one vector. Basic exception safety only (see class note).
     void add(std::int64_t id, const std::vector<float>& vector) {
         if (vector.size() != dimension_) {
             throw std::invalid_argument(
                 "tinyann::Index::add: vector dimension mismatch (expected " +
                 std::to_string(dimension_) + ", got " + std::to_string(vector.size()) + ")");
         }
+        require_finite(vector, "tinyann::Index::add");
         ids_.push_back(id);
         data_.insert(data_.end(), vector.begin(), vector.end());
     }
@@ -612,13 +661,14 @@ public:
 
     /// Replace the vector for every entry with the given id (in place).
     /// @return true if at least one entry was updated.
-    /// @throws std::invalid_argument on dimension mismatch
+    /// @throws std::invalid_argument on dimension mismatch or non-finite components
     bool update(std::int64_t id, const std::vector<float>& vector) {
         if (vector.size() != dimension_) {
             throw std::invalid_argument(
                 "tinyann::Index::update: vector dimension mismatch (expected " +
                 std::to_string(dimension_) + ", got " + std::to_string(vector.size()) + ")");
         }
+        require_finite(vector, "tinyann::Index::update");
         bool updated = false;
         for (std::size_t i = 0; i < ids_.size(); ++i) {
             if (ids_[i] != id) {
@@ -637,6 +687,7 @@ public:
     }
 
     /// Exact k-NN search. Best-first; empty if k==0 or index empty; all if k>n.
+    /// Query must be finite.
     std::vector<SearchResult> search(const std::vector<float>& query, std::size_t k) const {
         return search(query, k, [](std::int64_t) { return true; });
     }
@@ -653,6 +704,7 @@ public:
                 "tinyann::Index::search: query dimension mismatch (expected " +
                 std::to_string(dimension_) + ", got " + std::to_string(query.size()) + ")");
         }
+        require_finite(query, "tinyann::Index::search");
         if (k == 0 || empty()) {
             return {};
         }
@@ -756,6 +808,18 @@ struct HnswParams {
 };
 
 /// In-memory approximate k-NN index based on HNSW.
+///
+/// **Concurrency:** `search` is not safe to call concurrently on the *same*
+/// instance (mutable per-search visit stamps / query-norm cache). Concurrent
+/// searches require separate `HnswIndex` instances (or external locking).
+///
+/// **Capacity:** node indices are `int`; `add` rejects when `size() >= INT_MAX`.
+///
+/// **Exception safety:** `add` has the basic guarantee only (partial node on throw).
+///
+/// **Filtered search:** ineligible nodes may still be traversed for connectivity,
+/// but expansion is gated by the eligible heap — very selective filters can miss
+/// some eligible ids (not a post-filter of unfiltered top-k; see search docs).
 class HnswIndex {
 public:
     explicit HnswIndex(std::size_t dimension, Metric metric = Metric::Cosine,
@@ -781,11 +845,18 @@ public:
         params_.ef_search = ef;
     }
 
+    /// Insert one node. Basic exception safety only. Rejects non-finite vectors and
+    /// when the graph would exceed `INT_MAX` nodes (internal index type limit).
     void add(std::int64_t id, const std::vector<float>& vector) {
         if (vector.size() != dimension_) {
             throw std::invalid_argument(
                 "tinyann::HnswIndex::add: vector dimension mismatch (expected " +
                 std::to_string(dimension_) + ", got " + std::to_string(vector.size()) + ")");
+        }
+        require_finite(vector, "tinyann::HnswIndex::add");
+        if (ids_.size() >= static_cast<std::size_t>(std::numeric_limits<int>::max())) {
+            throw std::invalid_argument(
+                "tinyann::HnswIndex::add: maximum number of nodes (INT_MAX) reached");
         }
 
         const int node = static_cast<int>(ids_.size());
@@ -873,6 +944,7 @@ public:
                 "tinyann::HnswIndex::update: vector dimension mismatch (expected " +
                 std::to_string(dimension_) + ", got " + std::to_string(vector.size()) + ")");
         }
+        require_finite(vector, "tinyann::HnswIndex::update");
         bool updated = false;
         for (std::size_t i = 0; i < ids_.size(); ++i) {
             if (ids_[i] != id) {
@@ -891,6 +963,7 @@ public:
         return std::find(ids_.begin(), ids_.end(), id) != ids_.end();
     }
 
+    /// Approximate k-NN. Not concurrent-safe on the same instance (see class note).
     std::vector<SearchResult> search(const std::vector<float>& query, std::size_t k) const {
         return search(query, k, params_.ef_search, [](std::int64_t) { return true; });
     }
@@ -904,6 +977,11 @@ public:
     /// `predicate(id)` selects eligible ids. Navigation still uses the full graph
     /// (ineligible nodes can be traversed); only eligible nodes enter the result
     /// candidate set — not a post-filter of an unfiltered top-k.
+    ///
+    /// **Tradeoff:** once the eligible candidate heap is full, nodes farther than
+    /// the worst eligible (including ineligible "bridge" nodes) are not expanded.
+    /// Very selective filters may therefore miss some eligible ids; raise `ef` or
+    /// use exact `Index` when perfect filtered recall is required.
     template <typename Pred>
     auto search(const std::vector<float>& query, std::size_t k, Pred predicate) const
         -> std::enable_if_t<std::is_invocable_r<bool, Pred&, std::int64_t>::value,
@@ -912,6 +990,7 @@ public:
     }
 
     /// Filtered approximate k-NN with explicit ef (exploration width over eligible hits).
+    /// See overload without `ef` for the selective-filter tradeoff.
     template <typename Pred>
     auto search(const std::vector<float>& query, std::size_t k, std::size_t ef,
                 Pred predicate) const
@@ -922,6 +1001,7 @@ public:
                 "tinyann::HnswIndex::search: query dimension mismatch (expected " +
                 std::to_string(dimension_) + ", got " + std::to_string(query.size()) + ")");
         }
+        require_finite(query, "tinyann::HnswIndex::search");
         if (k == 0 || empty()) {
             return {};
         }
@@ -1041,6 +1121,7 @@ public:
 
     /// Load HNSW index from a file written by HnswIndex::save.
     /// Restored graph yields search results identical to the pre-save index.
+    /// Rejects corrupt/hostile graphs (OOB entry point, bad levels, invalid neighbor indices).
     static HnswIndex load(const std::string& path) {
         std::ifstream in(path, std::ios::binary);
         if (!in) {
@@ -1055,29 +1136,58 @@ public:
         detail::read_ids_and_vectors(in, dimension, metric, ids, data);
 
         HnswParams params;
-        params.M = static_cast<std::size_t>(detail::read_pod<std::uint64_t>(in));
-        params.ef_construction = static_cast<std::size_t>(detail::read_pod<std::uint64_t>(in));
-        params.ef_search = static_cast<std::size_t>(detail::read_pod<std::uint64_t>(in));
+        params.M = detail::size_from_u64(detail::read_pod<std::uint64_t>(in), "HNSW M");
+        params.ef_construction =
+            detail::size_from_u64(detail::read_pod<std::uint64_t>(in), "HNSW ef_construction");
+        params.ef_search =
+            detail::size_from_u64(detail::read_pod<std::uint64_t>(in), "HNSW ef_search");
         params.seed = detail::read_pod<std::uint64_t>(in);
 
         HnswIndex idx(dimension, metric, params);
         idx.ids_ = std::move(ids);
         idx.data_ = std::move(data);
+        if (idx.data_.size() !=
+            detail::checked_mul_size(idx.ids_.size(), idx.dimension_, "hnsw count * dimension")) {
+            throw std::runtime_error(
+                "tinyann::HnswIndex::load: corrupt file (vector storage size mismatch)");
+        }
         idx.rebuild_norms();
         idx.entry_point_ = detail::read_pod<std::int32_t>(in);
         idx.max_level_ = detail::read_pod<std::int32_t>(in);
 
         const std::size_t n = idx.ids_.size();
+        // Practical HNSW levels are small (log_M n). Cap rejects hostile huge layer counts
+        // before any adjacency allocation.
+        constexpr int kMaxHnswLevel = 64;
+        constexpr std::size_t kMaxRngStateBytes = 1u << 20;  // 1 MiB
+
         idx.levels_.resize(n);
         for (std::size_t i = 0; i < n; ++i) {
-            idx.levels_[i] = detail::read_pod<std::int32_t>(in);
+            const int level = detail::read_pod<std::int32_t>(in);
+            if (level < 0 || level > kMaxHnswLevel) {
+                throw std::runtime_error(
+                    "tinyann::HnswIndex::load: corrupt file (node level out of range)");
+            }
+            idx.levels_[i] = level;
         }
         idx.neighbors_.assign(n, {});
         for (std::size_t i = 0; i < n; ++i) {
             const auto n_layers = detail::read_pod<std::uint32_t>(in);
+            const std::size_t expected_layers =
+                static_cast<std::size_t>(idx.levels_[i]) + 1;
+            // Enforce layer count before resize (DoS + consistency with levels_[i]).
+            if (static_cast<std::size_t>(n_layers) != expected_layers) {
+                throw std::runtime_error(
+                    "tinyann::HnswIndex::load: corrupt file (neighbors layer count != level+1)");
+            }
             idx.neighbors_[i].resize(n_layers);
             for (std::uint32_t lc = 0; lc < n_layers; ++lc) {
                 const auto n_links = detail::read_pod<std::uint32_t>(in);
+                // A node cannot need more than n neighbor slots (hostile huge lists → DoS).
+                if (static_cast<std::size_t>(n_links) > n) {
+                    throw std::runtime_error(
+                        "tinyann::HnswIndex::load: corrupt file (adjacency list longer than index)");
+                }
                 idx.neighbors_[i][lc].resize(n_links);
                 for (std::uint32_t j = 0; j < n_links; ++j) {
                     idx.neighbors_[i][lc][j] = detail::read_pod<std::int32_t>(in);
@@ -1085,7 +1195,12 @@ public:
             }
         }
 
-        const auto rng_len = static_cast<std::size_t>(detail::read_pod<std::uint64_t>(in));
+        const std::uint64_t rng_len_u64 = detail::read_pod<std::uint64_t>(in);
+        if (rng_len_u64 > static_cast<std::uint64_t>(kMaxRngStateBytes)) {
+            throw std::runtime_error(
+                "tinyann::HnswIndex::load: corrupt file (rng state length too large)");
+        }
+        const auto rng_len = static_cast<std::size_t>(rng_len_u64);
         if (rng_len > 0) {
             std::string rng_state(rng_len, '\0');
             detail::read_bytes(in, &rng_state[0], rng_len);
@@ -1097,6 +1212,7 @@ public:
             }
         }
 
+        idx.validate_loaded_graph();
         return idx;
     }
 
@@ -1110,6 +1226,80 @@ private:
         }
         if (params.ef_construction == 0 || params.ef_search == 0) {
             throw std::invalid_argument("tinyann::HnswIndex: ef_construction/ef_search must be > 0");
+        }
+    }
+
+    /// Ensure entry point, levels, and adjacency lists are safe to traverse.
+    /// Called after binary load; throws runtime_error on corrupt/hostile payloads.
+    void validate_loaded_graph() const {
+        const std::size_t n = ids_.size();
+        if (data_.size() != n * dimension_) {
+            throw std::runtime_error(
+                "tinyann::HnswIndex::load: corrupt file (vector storage size mismatch)");
+        }
+        if (levels_.size() != n || neighbors_.size() != n || norms_.size() != n) {
+            throw std::runtime_error(
+                "tinyann::HnswIndex::load: corrupt file (per-node arrays size mismatch)");
+        }
+
+        if (n == 0) {
+            if (entry_point_ != -1 || max_level_ != -1) {
+                throw std::runtime_error(
+                    "tinyann::HnswIndex::load: corrupt file (empty graph must have "
+                    "entry_point=-1 and max_level=-1)");
+            }
+            return;
+        }
+
+        if (entry_point_ < 0 || static_cast<std::size_t>(entry_point_) >= n) {
+            throw std::runtime_error(
+                "tinyann::HnswIndex::load: corrupt file (entry_point out of range)");
+        }
+
+        int computed_max = levels_[0];
+        for (std::size_t i = 0; i < n; ++i) {
+            const int level = levels_[i];
+            if (level < 0) {
+                throw std::runtime_error(
+                    "tinyann::HnswIndex::load: corrupt file (negative node level)");
+            }
+            if (level > computed_max) {
+                computed_max = level;
+            }
+            // Layer list length must match declared level (layers 0..level inclusive).
+            if (neighbors_[i].size() != static_cast<std::size_t>(level) + 1) {
+                throw std::runtime_error(
+                    "tinyann::HnswIndex::load: corrupt file (neighbors layer count != level+1)");
+            }
+        }
+
+        if (max_level_ != computed_max) {
+            throw std::runtime_error(
+                "tinyann::HnswIndex::load: corrupt file (max_level inconsistent with node levels)");
+        }
+        if (levels_[static_cast<std::size_t>(entry_point_)] != max_level_) {
+            throw std::runtime_error(
+                "tinyann::HnswIndex::load: corrupt file (entry_point not at max_level)");
+        }
+
+        for (std::size_t i = 0; i < n; ++i) {
+            for (std::size_t lc = 0; lc < neighbors_[i].size(); ++lc) {
+                for (int nb : neighbors_[i][lc]) {
+                    if (nb < 0 || static_cast<std::size_t>(nb) >= n) {
+                        throw std::runtime_error(
+                            "tinyann::HnswIndex::load: corrupt file (neighbor index out of range)");
+                    }
+                    if (static_cast<std::size_t>(nb) == i) {
+                        throw std::runtime_error(
+                            "tinyann::HnswIndex::load: corrupt file (self-loop in graph)");
+                    }
+                    // Neighbor must exist on this layer (has layers 0..lc at least).
+                    if (neighbors_[static_cast<std::size_t>(nb)].size() <= lc) {
+                        throw std::runtime_error(
+                            "tinyann::HnswIndex::load: corrupt file (neighbor missing layer)");
+                    }
+                }
+            }
         }
     }
 
@@ -1327,6 +1517,11 @@ private:
     /// Layer search with id filter applied to the *eligible result* set only.
     /// Graph edges are still followed through ineligible nodes; those nodes never
     /// enter the result heap — unlike post-filtering an unfiltered top-ef list.
+    ///
+    /// Expansion rule (tradeoff): a neighbor is expanded only if the eligible heap
+    /// has fewer than `ef` hits, or its distance is better than the worst eligible.
+    /// Farther ineligible bridges are therefore skipped once the eligible set is full,
+    /// which can reduce recall under very selective predicates.
     template <typename Pred>
     std::vector<DistNode> search_layer_query_filtered(const float* q, int enter, std::size_t ef,
                                                       int layer, Pred predicate) const {
@@ -1411,7 +1606,8 @@ private:
     int entry_point_ = -1;
     int max_level_ = -1;
 
-    // Search-time caches (not serialized).
+    // Search-time caches (not serialized). Mutable so `search` can be const for
+    // callers, but **not** safe for concurrent search on the same instance.
     mutable float query_norm_ = 0.f;
     mutable std::vector<std::uint32_t> visit_mark_;
     mutable std::uint32_t visit_tick_ = 0;
@@ -1438,6 +1634,9 @@ struct IvfParams {
 };
 
 /// In-memory IVF index (k-means coarse quantizer + exact search in probed lists).
+///
+/// Vectors must be finite. `add` has basic exception safety only. Node indices
+/// are `int`; `add` rejects when `size() >= INT_MAX`.
 class IvfIndex {
 public:
     explicit IvfIndex(std::size_t dimension, Metric metric = Metric::Cosine, IvfParams params = {})
@@ -1480,6 +1679,7 @@ public:
             if (v.size() != dimension_) {
                 throw std::invalid_argument("tinyann::IvfIndex::train: dimension mismatch");
             }
+            require_finite(v, "tinyann::IvfIndex::train");
         }
 
         // Reset index contents; keep params.
@@ -1572,6 +1772,11 @@ public:
                 "tinyann::IvfIndex::add: vector dimension mismatch (expected " +
                 std::to_string(dimension_) + ", got " + std::to_string(vector.size()) + ")");
         }
+        require_finite(vector, "tinyann::IvfIndex::add");
+        if (ids_.size() >= static_cast<std::size_t>(std::numeric_limits<int>::max())) {
+            throw std::invalid_argument(
+                "tinyann::IvfIndex::add: maximum number of nodes (INT_MAX) reached");
+        }
         const int node = static_cast<int>(ids_.size());
         const std::size_t list = nearest_centroid(vector.data());
         ids_.push_back(id);
@@ -1597,6 +1802,7 @@ public:
                 "tinyann::IvfIndex::update: vector dimension mismatch (expected " +
                 std::to_string(dimension_) + ", got " + std::to_string(vector.size()) + ")");
         }
+        require_finite(vector, "tinyann::IvfIndex::update");
         bool updated = false;
         for (std::size_t i = 0; i < ids_.size(); ++i) {
             if (ids_[i] != id) {
@@ -1635,6 +1841,7 @@ public:
                 "tinyann::IvfIndex::search: query dimension mismatch (expected " +
                 std::to_string(dimension_) + ", got " + std::to_string(query.size()) + ")");
         }
+        require_finite(query, "tinyann::IvfIndex::search");
         if (!trained_ || k == 0 || empty()) {
             return {};
         }
@@ -1731,6 +1938,8 @@ public:
         }
     }
 
+    /// Load IVF index from a file written by IvfIndex::save.
+    /// Rejects corrupt/hostile payloads (bad list ids, OOB node indices, list/list_of mismatch).
     static IvfIndex load(const std::string& path) {
         std::ifstream in(path, std::ios::binary);
         if (!in) {
@@ -1744,33 +1953,120 @@ public:
         detail::read_ids_and_vectors(in, dimension, metric, ids, data);
 
         IvfParams params;
-        params.nlist = static_cast<std::size_t>(detail::read_pod<std::uint64_t>(in));
-        params.nprobe = static_cast<std::size_t>(detail::read_pod<std::uint64_t>(in));
-        params.kmeans_iters = static_cast<std::size_t>(detail::read_pod<std::uint64_t>(in));
+        params.nlist = detail::size_from_u64(detail::read_pod<std::uint64_t>(in), "IVF nlist");
+        params.nprobe = detail::size_from_u64(detail::read_pod<std::uint64_t>(in), "IVF nprobe");
+        params.kmeans_iters =
+            detail::size_from_u64(detail::read_pod<std::uint64_t>(in), "IVF kmeans_iters");
         params.seed = detail::read_pod<std::uint64_t>(in);
 
+        // Constructor validates nlist/nprobe/kmeans_iters > 0.
         IvfIndex idx(dimension, metric, params);
         idx.ids_ = std::move(ids);
         idx.data_ = std::move(data);
-        idx.centroids_.resize(params.nlist * dimension);
-        detail::read_bytes(in, idx.centroids_.data(), idx.centroids_.size() * sizeof(float));
+        if (idx.data_.size() !=
+            detail::checked_mul_size(idx.ids_.size(), idx.dimension_, "ivf count * dimension")) {
+            throw std::runtime_error(
+                "tinyann::IvfIndex::load: corrupt file (vector storage size mismatch)");
+        }
+        const std::size_t n_cent =
+            detail::checked_mul_size(params.nlist, dimension, "nlist * dimension (centroids)");
+        const std::size_t cent_bytes =
+            detail::checked_mul_size(n_cent, sizeof(float), "centroids bytes");
+        idx.centroids_.resize(n_cent);
+        detail::read_bytes(in, idx.centroids_.data(), cent_bytes);
         idx.list_of_.resize(idx.ids_.size());
         for (std::size_t i = 0; i < idx.list_of_.size(); ++i) {
             idx.list_of_[i] = detail::read_pod<std::uint32_t>(in);
         }
         idx.lists_.assign(params.nlist, {});
         for (std::size_t c = 0; c < params.nlist; ++c) {
-            const auto sz = detail::read_pod<std::uint32_t>(in);
+            const auto sz = static_cast<std::size_t>(detail::read_pod<std::uint32_t>(in));
+            // Bound list length: a list cannot hold more than n nodes (even with dups rejected later).
+            if (sz > idx.ids_.size()) {
+                throw std::runtime_error(
+                    "tinyann::IvfIndex::load: corrupt file (inverted list longer than index)");
+            }
             idx.lists_[c].resize(sz);
-            for (std::uint32_t j = 0; j < sz; ++j) {
+            for (std::size_t j = 0; j < sz; ++j) {
                 idx.lists_[c][j] = detail::read_pod<std::int32_t>(in);
             }
+        }
+        idx.validate_loaded_lists();
+        // Canonical inverted lists from validated list_of_ (file lists only for cross-check).
+        idx.rebuild_lists_from_list_of();
+        if (idx.params_.nprobe > idx.params_.nlist) {
+            idx.params_.nprobe = idx.params_.nlist;
         }
         idx.trained_ = true;
         return idx;
     }
 
 private:
+    /// Ensure list_of_ / lists_ / centroids are safe to search and mutate.
+    /// Called after binary load; throws runtime_error on corrupt/hostile payloads.
+    void validate_loaded_lists() const {
+        const std::size_t n = ids_.size();
+        if (data_.size() != n * dimension_) {
+            throw std::runtime_error(
+                "tinyann::IvfIndex::load: corrupt file (vector storage size mismatch)");
+        }
+        if (list_of_.size() != n) {
+            throw std::runtime_error(
+                "tinyann::IvfIndex::load: corrupt file (list_of size mismatch)");
+        }
+        if (params_.nlist == 0 || lists_.size() != params_.nlist) {
+            throw std::runtime_error(
+                "tinyann::IvfIndex::load: corrupt file (lists / nlist mismatch)");
+        }
+        if (centroids_.size() != params_.nlist * dimension_) {
+            throw std::runtime_error(
+                "tinyann::IvfIndex::load: corrupt file (centroids size mismatch)");
+        }
+
+        for (std::size_t i = 0; i < n; ++i) {
+            if (list_of_[i] >= params_.nlist) {
+                throw std::runtime_error(
+                    "tinyann::IvfIndex::load: corrupt file (list_of entry out of range)");
+            }
+        }
+
+        // Cross-check serialized inverted lists against list_of_: every node appears exactly
+        // once, only in the list claimed by list_of_[node].
+        std::vector<std::uint8_t> seen(n, 0);
+        for (std::size_t c = 0; c < params_.nlist; ++c) {
+            for (int node : lists_[c]) {
+                if (node < 0 || static_cast<std::size_t>(node) >= n) {
+                    throw std::runtime_error(
+                        "tinyann::IvfIndex::load: corrupt file (list node index out of range)");
+                }
+                const std::size_t u = static_cast<std::size_t>(node);
+                if (list_of_[u] != c) {
+                    throw std::runtime_error(
+                        "tinyann::IvfIndex::load: corrupt file (lists disagree with list_of)");
+                }
+                if (seen[u] != 0) {
+                    throw std::runtime_error(
+                        "tinyann::IvfIndex::load: corrupt file (duplicate node in lists)");
+                }
+                seen[u] = 1;
+            }
+        }
+        for (std::size_t i = 0; i < n; ++i) {
+            if (seen[i] == 0) {
+                throw std::runtime_error(
+                    "tinyann::IvfIndex::load: corrupt file (node missing from lists)");
+            }
+        }
+    }
+
+    /// Rebuild inverted lists from list_of_ (source of truth after validation).
+    void rebuild_lists_from_list_of() {
+        lists_.assign(params_.nlist, {});
+        for (std::size_t i = 0; i < list_of_.size(); ++i) {
+            lists_[list_of_[i]].push_back(static_cast<int>(i));
+        }
+    }
+
     void normalize_centroid(std::size_t c) {
         float* p = centroids_.data() + c * dimension_;
         const float n = l2_norm(p, dimension_);
@@ -1928,6 +2224,7 @@ inline std::vector<float> dequantize(const std::vector<std::int8_t>& codes, floa
 
 /// Exact k-NN over **int8 scalar-quantized** vectors (per-vector symmetric scale).
 /// Distances use dequantized floats and the same metrics as `Index`.
+/// Finite input vectors required on `add`/`update`/`search`. Basic exception safety on `add`.
 class IndexSq {
 public:
     explicit IndexSq(std::size_t dimension, Metric metric = Metric::Cosine)
@@ -1942,13 +2239,14 @@ public:
     std::size_t size() const noexcept { return ids_.size(); }
     bool empty() const noexcept { return ids_.empty(); }
 
-    /// Quantize and store (int8 codes + scale).
+    /// Quantize and store (int8 codes + scale). Basic exception safety only.
     void add(std::int64_t id, const std::vector<float>& vector) {
         if (vector.size() != dimension_) {
             throw std::invalid_argument(
                 "tinyann::IndexSq::add: vector dimension mismatch (expected " +
                 std::to_string(dimension_) + ", got " + std::to_string(vector.size()) + ")");
         }
+        require_finite(vector, "tinyann::IndexSq::add");
         float scale = 1.f;
         const std::size_t off = codes_.size();
         codes_.resize(off + dimension_);
@@ -1986,6 +2284,7 @@ public:
                 "tinyann::IndexSq::update: vector dimension mismatch (expected " +
                 std::to_string(dimension_) + ", got " + std::to_string(vector.size()) + ")");
         }
+        require_finite(vector, "tinyann::IndexSq::update");
         bool updated = false;
         for (std::size_t i = 0; i < ids_.size(); ++i) {
             if (ids_[i] != id) {
@@ -2031,6 +2330,7 @@ public:
                 "tinyann::IndexSq::search: query dimension mismatch (expected " +
                 std::to_string(dimension_) + ", got " + std::to_string(query.size()) + ")");
         }
+        require_finite(query, "tinyann::IndexSq::search");
         if (k == 0 || empty()) {
             return {};
         }
@@ -2104,19 +2404,28 @@ public:
         }
         detail::read_header(in, detail::kKindSq);
         const Metric metric = detail::metric_from_u32(detail::read_pod<std::uint32_t>(in));
-        const std::size_t dimension = static_cast<std::size_t>(detail::read_pod<std::uint64_t>(in));
-        const std::size_t count = static_cast<std::size_t>(detail::read_pod<std::uint64_t>(in));
+        const std::size_t dimension =
+            detail::size_from_u64(detail::read_pod<std::uint64_t>(in), "sq dimension");
+        const std::size_t count =
+            detail::size_from_u64(detail::read_pod<std::uint64_t>(in), "sq vector count");
         if (dimension == 0) {
             throw std::runtime_error("tinyann::IndexSq::load: corrupt (dimension == 0)");
         }
+        const std::size_t n_codes =
+            detail::checked_mul_size(count, dimension, "sq count * dimension");
+        const std::size_t ids_bytes =
+            detail::checked_mul_size(count, sizeof(std::int64_t), "sq ids bytes");
+        const std::size_t scales_bytes =
+            detail::checked_mul_size(count, sizeof(float), "sq scales bytes");
+        // codes are int8: byte count == n_codes
         IndexSq idx(dimension, metric);
         idx.ids_.resize(count);
         idx.scales_.resize(count);
-        idx.codes_.resize(count * dimension);
+        idx.codes_.resize(n_codes);
         if (count > 0) {
-            detail::read_bytes(in, idx.ids_.data(), count * sizeof(std::int64_t));
-            detail::read_bytes(in, idx.scales_.data(), count * sizeof(float));
-            detail::read_bytes(in, idx.codes_.data(), count * dimension * sizeof(std::int8_t));
+            detail::read_bytes(in, idx.ids_.data(), ids_bytes);
+            detail::read_bytes(in, idx.scales_.data(), scales_bytes);
+            detail::read_bytes(in, idx.codes_.data(), n_codes);
         }
         return idx;
     }

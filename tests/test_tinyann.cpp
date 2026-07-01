@@ -1,10 +1,14 @@
 #include "tinyann/tinyann.hpp"
+#include "tinyann/text_io.hpp"
 
 #include <cmath>
 #include <cstdint>
 #include <cstdlib>
 #include <cstring>
+#include <fstream>
 #include <iostream>
+#include <iterator>
+#include <limits>
 #include <random>
 #include <string>
 #include <vector>
@@ -594,6 +598,193 @@ void test_hnsw_load_rejects_exact_file() {
     CHECK(threw);
 }
 
+/// Read whole file into a buffer (for corrupting HNSW payloads in tests).
+std::vector<char> read_file_bytes(const std::string& path) {
+    std::ifstream in(path, std::ios::binary);
+    return std::vector<char>((std::istreambuf_iterator<char>(in)),
+                             std::istreambuf_iterator<char>());
+}
+
+void write_file_bytes(const std::string& path, const std::vector<char>& buf) {
+    std::ofstream out(path, std::ios::binary | std::ios::trunc);
+    out.write(buf.data(), static_cast<std::streamsize>(buf.size()));
+}
+
+/// Byte offset of entry_point (int32) in an HNSW save file (after params/seed).
+/// Layout: header | metric,dim,count,ids,data | M,efc,efs,seed | entry_point | ...
+std::size_t hnsw_entry_point_offset(const std::vector<char>& buf) {
+    std::size_t off = 0;
+    auto need = [&](std::size_t n) {
+        if (off + n > buf.size()) {
+            throw std::runtime_error("hnsw test helper: truncated buffer");
+        }
+    };
+    need(4 + 4 + 4);  // magic, version, kind
+    off += 12;
+    need(4);
+    off += 4;  // metric
+    need(16);
+    std::uint64_t dim = 0;
+    std::uint64_t count = 0;
+    std::memcpy(&dim, buf.data() + off, 8);
+    off += 8;
+    std::memcpy(&count, buf.data() + off, 8);
+    off += 8;
+    need(count * 8 + count * dim * 4 + 8 * 4);
+    off += count * 8;          // ids
+    off += count * dim * 4;    // floats
+    off += 8 * 4;              // M, efc, efs, seed
+    return off;
+}
+
+bool hnsw_load_throws(const std::string& path) {
+    try {
+        (void)tinyann::HnswIndex::load(path);
+        return false;
+    } catch (const std::runtime_error&) {
+        return true;
+    }
+}
+
+void test_hnsw_load_rejects_corrupt_graph() {
+    tinyann::HnswParams p;
+    p.M = 4;
+    p.ef_construction = 16;
+    p.ef_search = 8;
+    p.seed = 1;
+    tinyann::HnswIndex h(2, tinyann::Metric::InnerProduct, p);
+    h.add(1, {1.f, 0.f});
+    h.add(2, {0.f, 1.f});
+    h.add(3, {0.5f, 0.f});
+
+    const std::string good = temp_path("tinyann_hnsw_graph_good.bin");
+    h.save(good);
+    // Sanity: good file still loads and searches.
+    {
+        auto loaded = tinyann::HnswIndex::load(good);
+        CHECK(loaded.size() == 3);
+        auto hits = loaded.search({1.f, 0.f}, 1);
+        CHECK(hits.size() == 1);
+        CHECK(hits[0].id == 1);
+    }
+
+    const auto base = read_file_bytes(good);
+    const std::size_t ep_off = hnsw_entry_point_offset(base);
+
+    // 1) entry_point out of range
+    {
+        auto buf = base;
+        const std::int32_t bad_ep = 999;
+        std::memcpy(buf.data() + ep_off, &bad_ep, sizeof(bad_ep));
+        const std::string path = temp_path("tinyann_hnsw_bad_ep.bin");
+        write_file_bytes(path, buf);
+        CHECK(hnsw_load_throws(path));
+    }
+
+    // 2) negative entry_point (non-empty)
+    {
+        auto buf = base;
+        const std::int32_t bad_ep = -1;
+        std::memcpy(buf.data() + ep_off, &bad_ep, sizeof(bad_ep));
+        const std::string path = temp_path("tinyann_hnsw_neg_ep.bin");
+        write_file_bytes(path, buf);
+        CHECK(hnsw_load_throws(path));
+    }
+
+    // 3) max_level inconsistent with node levels (entry still at real max)
+    {
+        auto buf = base;
+        std::int32_t max_level = 0;
+        std::memcpy(&max_level, buf.data() + ep_off + 4, sizeof(max_level));
+        const std::int32_t bad_ml = max_level + 50;
+        std::memcpy(buf.data() + ep_off + 4, &bad_ml, sizeof(bad_ml));
+        const std::string path = temp_path("tinyann_hnsw_bad_maxlevel.bin");
+        write_file_bytes(path, buf);
+        CHECK(hnsw_load_throws(path));
+    }
+
+    // 4) OOB neighbor index: patch first neighbor int32 after first node's layer header.
+    // After entry_point(4)+max_level(4)+levels(n*4), first node writes n_layers u32, then
+    // for layer 0: n_links u32, then n_links * i32 neighbors.
+    {
+        auto buf = base;
+        const std::size_t n = 3;
+        std::size_t off = ep_off + 8;  // past entry + max_level
+        off += n * 4;                  // levels
+        // n_layers for node 0
+        std::uint32_t n_layers = 0;
+        std::memcpy(&n_layers, buf.data() + off, 4);
+        off += 4;
+        CHECK(n_layers >= 1);
+        std::uint32_t n_links = 0;
+        std::memcpy(&n_links, buf.data() + off, 4);
+        off += 4;
+        if (n_links > 0) {
+            const std::int32_t bad_nb = 999;
+            std::memcpy(buf.data() + off, &bad_nb, sizeof(bad_nb));
+            const std::string path = temp_path("tinyann_hnsw_bad_neighbor.bin");
+            write_file_bytes(path, buf);
+            CHECK(hnsw_load_throws(path));
+        } else {
+            // Degenerate: force a self-loop style corruption on levels layer count instead.
+            // neighbors_[0].size() mismatch: set n_layers to 0 while level may be >= 0.
+            off = ep_off + 8 + n * 4;
+            const std::uint32_t zero_layers = 0;
+            std::memcpy(buf.data() + off, &zero_layers, 4);
+            // File may now be misaligned for remaining nodes; load should still fail validation
+            // or fail mid-read. Either is acceptable rejection.
+            const std::string path = temp_path("tinyann_hnsw_bad_layers.bin");
+            write_file_bytes(path, buf);
+            CHECK(hnsw_load_throws(path));
+        }
+    }
+
+    // 5) layer count mismatch: set node 0's n_layers to level+1+1 without enough payload —
+    //    simpler: rewrite levels[0] to a huge level so neighbors size won't match after read.
+    //    Changing only levels[0] to levels[0]+1 makes neighbors_[0].size() != level+1.
+    {
+        auto buf = base;
+        const std::size_t levels_off = ep_off + 8;
+        std::int32_t lvl0 = 0;
+        std::memcpy(&lvl0, buf.data() + levels_off, 4);
+        const std::int32_t bad_lvl = lvl0 + 1;
+        std::memcpy(buf.data() + levels_off, &bad_lvl, 4);
+        // max_level / entry may also become inconsistent; either way load must reject.
+        const std::string path = temp_path("tinyann_hnsw_bad_level_field.bin");
+        write_file_bytes(path, buf);
+        CHECK(hnsw_load_throws(path));
+    }
+
+    // 6) Hostile adjacency length: n_links > n must be rejected *before* huge allocate.
+    {
+        auto buf = base;
+        const std::size_t n_nodes = 3;
+        std::size_t off = ep_off + 8 + n_nodes * 4;  // past entry, max_level, levels
+        std::uint32_t n_layers = 0;
+        std::memcpy(&n_layers, buf.data() + off, 4);
+        off += 4;
+        CHECK(n_layers >= 1);
+        // Overwrite first layer's n_links with a value larger than n (but small enough for test
+        // file — rejection is on the count, before resize of an absurd allocation).
+        const std::uint32_t huge_links = 100;  // > n=3
+        std::memcpy(buf.data() + off, &huge_links, 4);
+        const std::string path = temp_path("tinyann_hnsw_huge_links.bin");
+        write_file_bytes(path, buf);
+        CHECK(hnsw_load_throws(path));
+    }
+
+    // 7) Absurd node level (above kMaxHnswLevel=64) rejected early.
+    {
+        auto buf = base;
+        const std::size_t levels_off = ep_off + 8;
+        const std::int32_t absurd = 10'000;
+        std::memcpy(buf.data() + levels_off, &absurd, 4);
+        const std::string path = temp_path("tinyann_hnsw_absurd_level.bin");
+        write_file_bytes(path, buf);
+        CHECK(hnsw_load_throws(path));
+    }
+}
+
 void test_persistence_all_metrics() {
     for (auto metric : {tinyann::Metric::Cosine, tinyann::Metric::Euclidean,
                         tinyann::Metric::InnerProduct}) {
@@ -972,6 +1163,316 @@ void test_ivf_save_load() {
     CHECK(results_byte_identical(before, loaded.search(q, 5)));
 }
 
+/// Byte offset of first list_of_ u32 in an IVF save file.
+/// Layout: header | metric,dim,count,ids,data | nlist,nprobe,iters,seed | centroids | list_of...
+std::size_t ivf_list_of_offset(const std::vector<char>& buf) {
+    std::size_t off = 0;
+    auto need = [&](std::size_t n) {
+        if (off + n > buf.size()) {
+            throw std::runtime_error("ivf test helper: truncated buffer");
+        }
+    };
+    need(12);
+    off += 12;  // magic, version, kind
+    need(4);
+    off += 4;  // metric
+    need(16);
+    std::uint64_t dim = 0;
+    std::uint64_t count = 0;
+    std::memcpy(&dim, buf.data() + off, 8);
+    off += 8;
+    std::memcpy(&count, buf.data() + off, 8);
+    off += 8;
+    need(count * 8 + count * dim * 4 + 8 * 4);
+    off += count * 8;
+    off += count * dim * 4;
+    std::uint64_t nlist = 0;
+    std::memcpy(&nlist, buf.data() + off, 8);
+    off += 8;       // nlist
+    off += 8 * 3;   // nprobe, kmeans_iters, seed
+    need(nlist * dim * 4);
+    off += nlist * dim * 4;  // centroids
+    return off;
+}
+
+bool ivf_load_throws(const std::string& path) {
+    try {
+        (void)tinyann::IvfIndex::load(path);
+        return false;
+    } catch (const std::exception&) {
+        return true;
+    }
+}
+
+/// Craft a minimal exact-index header with hostile count/dimension (no vector payload).
+void write_hostile_exact_header(const std::string& path, std::uint64_t dim, std::uint64_t count) {
+    std::ofstream out(path, std::ios::binary | std::ios::trunc);
+    const char magic[4] = {'T', 'A', 'N', 'N'};
+    out.write(magic, 4);
+    const std::uint32_t ver = 1;
+    const std::uint32_t kind = 1;  // exact
+    const std::uint32_t metric = 0;
+    out.write(reinterpret_cast<const char*>(&ver), 4);
+    out.write(reinterpret_cast<const char*>(&kind), 4);
+    out.write(reinterpret_cast<const char*>(&metric), 4);
+    out.write(reinterpret_cast<const char*>(&dim), 8);
+    out.write(reinterpret_cast<const char*>(&count), 8);
+}
+
+void write_hostile_sq_header(const std::string& path, std::uint64_t dim, std::uint64_t count) {
+    std::ofstream out(path, std::ios::binary | std::ios::trunc);
+    const char magic[4] = {'T', 'A', 'N', 'N'};
+    out.write(magic, 4);
+    const std::uint32_t ver = 1;
+    const std::uint32_t kind = 4;  // SQ
+    const std::uint32_t metric = 0;
+    out.write(reinterpret_cast<const char*>(&ver), 4);
+    out.write(reinterpret_cast<const char*>(&kind), 4);
+    out.write(reinterpret_cast<const char*>(&metric), 4);
+    out.write(reinterpret_cast<const char*>(&dim), 8);
+    out.write(reinterpret_cast<const char*>(&count), 8);
+}
+
+void test_reject_non_finite() {
+    tinyann::Index idx(2, tinyann::Metric::InnerProduct);
+    bool threw = false;
+    try {
+        idx.add(1, {1.f, std::numeric_limits<float>::quiet_NaN()});
+    } catch (const std::invalid_argument&) {
+        threw = true;
+    }
+    CHECK(threw);
+    CHECK(idx.empty());
+
+    idx.add(1, {1.f, 0.f});
+    threw = false;
+    try {
+        (void)idx.search({std::numeric_limits<float>::infinity(), 0.f}, 1);
+    } catch (const std::invalid_argument&) {
+        threw = true;
+    }
+    CHECK(threw);
+
+    tinyann::HnswParams p;
+    p.M = 4;
+    p.ef_construction = 8;
+    p.ef_search = 4;
+    tinyann::HnswIndex h(2, tinyann::Metric::Cosine, p);
+    threw = false;
+    try {
+        h.add(1, {0.f, std::numeric_limits<float>::quiet_NaN()});
+    } catch (const std::invalid_argument&) {
+        threw = true;
+    }
+    CHECK(threw);
+}
+
+void test_parse_vector_text_line_int64_ids() {
+    bool has_id = false;
+    std::int64_t id = 0;
+    std::vector<float> vec;
+
+    // Large id must not go through float (2^24+1).
+    CHECK(tinyann::parse_vector_text_line("16777217 1.0 0.0", 2, true, has_id, id, vec));
+    CHECK(has_id);
+    CHECK(id == 16777217);
+    CHECK(vec.size() == 2);
+    CHECK_NEAR(vec[0], 1.0, 1e-6);
+    CHECK_NEAR(vec[1], 0.0, 1e-6);
+
+    // Negative ids are first-class (not treated as "missing id").
+    CHECK(tinyann::parse_vector_text_line("-5 3.0 4.0", 2, true, has_id, id, vec));
+    CHECK(has_id);
+    CHECK(id == -5);
+    CHECK_NEAR(vec[0], 3.0, 1e-6);
+    CHECK_NEAR(vec[1], 4.0, 1e-6);
+
+    // No id column
+    CHECK(tinyann::parse_vector_text_line("1.5 -2.5", 2, true, has_id, id, vec));
+    CHECK(!has_id);
+    CHECK(vec.size() == 2);
+
+    // Reject non-integer id tokens (old float-style ids)
+    CHECK(!tinyann::parse_vector_text_line("1.0 1.0 0.0", 2, true, has_id, id, vec));
+    CHECK(!tinyann::parse_vector_text_line("1e2 1.0 0.0", 2, true, has_id, id, vec));
+
+    // Wrong arity
+    CHECK(!tinyann::parse_vector_text_line("1 2 3 4", 2, true, has_id, id, vec));
+    CHECK(!tinyann::parse_vector_text_line("", 2, true, has_id, id, vec));
+
+    // Very large int64 still exact as text
+    CHECK(tinyann::parse_vector_text_line("9223372036854775806 0.0", 1, true, has_id, id, vec));
+    CHECK(has_id);
+    CHECK(id == 9223372036854775806LL);
+}
+
+void test_load_rejects_size_overflow() {
+    // count * dimension overflows size_t on 64-bit (and would wrap to a small value without checks).
+    const std::uint64_t huge = (std::uint64_t{1} << 32);
+    {
+        const std::string path = temp_path("tinyann_overflow_exact.bin");
+        write_hostile_exact_header(path, huge, huge);
+        bool threw = false;
+        try {
+            (void)tinyann::Index::load(path);
+        } catch (const std::runtime_error& e) {
+            threw = true;
+            const std::string msg = e.what();
+            CHECK(msg.find("overflow") != std::string::npos ||
+                  msg.find("size") != std::string::npos);
+        }
+        CHECK(threw);
+    }
+    {
+        const std::string path = temp_path("tinyann_overflow_sq.bin");
+        write_hostile_sq_header(path, huge, huge);
+        bool threw = false;
+        try {
+            (void)tinyann::IndexSq::load(path);
+        } catch (const std::runtime_error& e) {
+            threw = true;
+            const std::string msg = e.what();
+            CHECK(msg.find("overflow") != std::string::npos ||
+                  msg.find("size") != std::string::npos);
+        }
+        CHECK(threw);
+    }
+
+    // IVF: huge nlist * dimension for centroids (after a tiny valid vector block).
+    // Build a minimal IVF-shaped file: header + empty vectors + huge nlist.
+    {
+        const std::string path = temp_path("tinyann_overflow_ivf_cent.bin");
+        std::ofstream out(path, std::ios::binary | std::ios::trunc);
+        const char magic[4] = {'T', 'A', 'N', 'N'};
+        out.write(magic, 4);
+        const std::uint32_t ver = 1;
+        const std::uint32_t kind = 3;  // IVF
+        const std::uint32_t metric = 0;
+        const std::uint64_t dim = 64;
+        const std::uint64_t count = 0;
+        out.write(reinterpret_cast<const char*>(&ver), 4);
+        out.write(reinterpret_cast<const char*>(&kind), 4);
+        out.write(reinterpret_cast<const char*>(&metric), 4);
+        out.write(reinterpret_cast<const char*>(&dim), 8);
+        out.write(reinterpret_cast<const char*>(&count), 8);
+        // nlist * dim must overflow size_t (dim=64 above).
+        const std::uint64_t nlist =
+            static_cast<std::uint64_t>(std::numeric_limits<std::size_t>::max() / 64) + 1;
+        const std::uint64_t nprobe = 1;
+        const std::uint64_t iters = 1;
+        const std::uint64_t seed = 1;
+        out.write(reinterpret_cast<const char*>(&nlist), 8);
+        out.write(reinterpret_cast<const char*>(&nprobe), 8);
+        out.write(reinterpret_cast<const char*>(&iters), 8);
+        out.write(reinterpret_cast<const char*>(&seed), 8);
+        out.close();
+
+        bool threw = false;
+        try {
+            (void)tinyann::IvfIndex::load(path);
+        } catch (const std::runtime_error&) {
+            threw = true;
+        } catch (const std::invalid_argument&) {
+            // ctor may reject absurd params in future; either way load must not succeed.
+            threw = true;
+        }
+        CHECK(threw);
+    }
+
+    // Normal small exact file still loads (regression).
+    {
+        tinyann::Index idx(2, tinyann::Metric::Cosine);
+        idx.add(1, {1.f, 0.f});
+        const std::string path = temp_path("tinyann_overflow_control.bin");
+        idx.save(path);
+        auto loaded = tinyann::Index::load(path);
+        CHECK(loaded.size() == 1);
+        CHECK(loaded.search({1.f, 0.f}, 1)[0].id == 1);
+    }
+}
+
+void test_ivf_load_rejects_corrupt_lists() {
+    tinyann::IvfParams p;
+    p.nlist = 4;
+    p.nprobe = 4;
+    p.kmeans_iters = 10;
+    p.seed = 1;
+    tinyann::IvfIndex ivf(2, tinyann::Metric::InnerProduct, p);
+    std::vector<std::vector<float>> train = {{1.f, 0.f}, {0.f, 1.f}, {0.5f, 0.f}, {-1.f, 0.f}};
+    ivf.train(train);
+    for (std::size_t i = 0; i < train.size(); ++i) {
+        ivf.add(static_cast<std::int64_t>(i + 1), train[i]);
+    }
+
+    const std::string good = temp_path("tinyann_ivf_lists_good.bin");
+    ivf.save(good);
+    {
+        auto loaded = tinyann::IvfIndex::load(good);
+        CHECK(loaded.size() == 4);
+        auto hits = loaded.search({1.f, 0.f}, 1);
+        CHECK(hits.size() == 1);
+        CHECK(hits[0].id == 1);
+    }
+
+    const auto base = read_file_bytes(good);
+    const std::size_t list_of_off = ivf_list_of_offset(base);
+    const std::size_t n = 4;
+
+    // 1) list_of_[0] out of range (>= nlist)
+    {
+        auto buf = base;
+        const std::uint32_t bad = 999;
+        std::memcpy(buf.data() + list_of_off, &bad, sizeof(bad));
+        const std::string path = temp_path("tinyann_ivf_bad_list_of.bin");
+        write_file_bytes(path, buf);
+        CHECK(ivf_load_throws(path));
+    }
+
+    // 2) OOB node index in first inverted list (after list_of block)
+    {
+        auto buf = base;
+        std::size_t off = list_of_off + n * 4;  // past list_of
+        // lists_[0]: size u32, then nodes
+        std::uint32_t sz0 = 0;
+        std::memcpy(&sz0, buf.data() + off, 4);
+        off += 4;
+        if (sz0 > 0) {
+            const std::int32_t bad_node = 999;
+            std::memcpy(buf.data() + off, &bad_node, sizeof(bad_node));
+            const std::string path = temp_path("tinyann_ivf_bad_list_node.bin");
+            write_file_bytes(path, buf);
+            CHECK(ivf_load_throws(path));
+        } else {
+            // Empty first list: corrupt by claiming size 1 and writing OOB (may need extra bytes).
+            // Fall back: duplicate-style — set list_of[0] to a valid other list id without
+            // updating lists (inconsistency between list_of and lists).
+            auto buf2 = base;
+            std::uint32_t orig = 0;
+            std::memcpy(&orig, buf2.data() + list_of_off, 4);
+            const std::uint32_t flipped = (orig + 1) % 4;
+            std::memcpy(buf2.data() + list_of_off, &flipped, 4);
+            const std::string path = temp_path("tinyann_ivf_list_of_lists_mismatch.bin");
+            write_file_bytes(path, buf2);
+            CHECK(ivf_load_throws(path));
+        }
+    }
+
+    // 3) list_of disagrees with lists (valid range but wrong assignment)
+    {
+        auto buf = base;
+        std::uint32_t orig = 0;
+        std::memcpy(&orig, buf.data() + list_of_off, 4);
+        const std::uint32_t flipped = (orig + 1) % static_cast<std::uint32_t>(4);
+        if (flipped == orig) {
+            // nlist edge: force 0 vs 1
+        }
+        std::memcpy(buf.data() + list_of_off, &flipped, 4);
+        const std::string path = temp_path("tinyann_ivf_assignment_mismatch.bin");
+        write_file_bytes(path, buf);
+        CHECK(ivf_load_throws(path));
+    }
+}
+
 void test_sq_quantize_dequantize() {
     const std::vector<float> v = {0.f, 1.f, -1.f, 0.5f, -0.25f, 127.f, -64.f};
     std::vector<std::int8_t> codes;
@@ -1186,6 +1687,10 @@ int main() {
     test_exact_load_rejects_hnsw_file();
     test_hnsw_save_load_identical_search();
     test_hnsw_load_rejects_exact_file();
+    test_hnsw_load_rejects_corrupt_graph();
+    test_load_rejects_size_overflow();
+    test_parse_vector_text_line_int64_ids();
+    test_reject_non_finite();
     test_persistence_all_metrics();
     test_exact_remove_update();
     test_hnsw_remove_update();
@@ -1199,6 +1704,7 @@ int main() {
     test_ivf_basic_and_filter();
     test_ivf_recall();
     test_ivf_save_load();
+    test_ivf_load_rejects_corrupt_lists();
     test_ivf_remove_update();
     test_sq_quantize_dequantize();
     test_index_sq_search_and_recall();
