@@ -2486,23 +2486,25 @@ struct IvfPqParams {
     bool use_opq = false;
     /// Alternating OPQ iterations (rotation ↔ PQ codebooks). Ignored if `!use_opq`.
     std::size_t opq_iters = 10;
+    /// If true, keep original float vectors for exact re-ranking (`nrefine`).
+    bool store_raw = false;
+    /// Default re-rank shortlist size (0 = off). Requires `store_raw` when > 0.
+    /// Effective shortlist is `max(k, nrefine)`.
+    std::size_t nrefine = 0;
 };
 
 /// In-memory IVF index with product-quantized residuals (compressed corpus).
 ///
-/// Stores only M-byte codes per vector (plus inverted lists / centroids / codebooks).
-/// Suitable for large corpora where full-float IVF or HNSW RAM is prohibitive.
-/// Concurrent search is safe while the index is immutable (no concurrent train/add).
+/// Default: M-byte codes per vector (+ lists / centroids / codebooks). Optional
+/// OPQ rotation and optional exact re-rank (`store_raw` + `nrefine`).
+/// Concurrent search is safe while the index is immutable.
 ///
-/// **Optional OPQ:** with `use_opq=true`, a learned orthogonal matrix `R` is applied
-/// to residuals before PQ (`y = R r`). Encode/search/reconstruct use `R` / `Rᵀ`
-/// consistently (FAISS-style optimized product quantization on residuals).
+/// **OPQ:** learned orthogonal `R` on residuals before PQ (`y = R r`).
+/// **Re-rank:** shortlist via approx IVFPQ, then exact `metric_score` on raw floats.
 ///
-/// **Metrics (consistent with `Index` / `IvfIndex` / `HnswIndex`):**
-/// - **Euclidean:** residual L2 ADC (approx squared residual distance; lower better).
-/// - **InnerProduct:** asymmetric IP ADC on residual reconstruction (higher better).
-/// - **Cosine:** inputs are **L2-normalized** on train/add/update/search (scale-invariant
-///   like true cosine); scores are true `cosine_similarity(query, reconstruct(code))`.
+/// **Metrics:** Euclidean residual L2 ADC; IP asymmetric ADC; Cosine normalizes for
+/// the PQ path and scores `cosine_similarity` vs reconstruct (refine uses exact
+/// cosine on original floats).
 class IvfPqIndex {
 public:
     /// Fixed 8-bit codes per subspace (FAISS default ksub = 256).
@@ -2523,12 +2525,21 @@ public:
     std::size_t code_size() const noexcept { return params_.M; }  // bytes per vector
     /// True if an OPQ rotation was trained (matrix size dim×dim).
     bool uses_opq() const noexcept { return params_.use_opq && opq_R_.size() == dimension_ * dimension_; }
+    bool stores_raw() const noexcept { return params_.store_raw; }
 
     void set_nprobe(std::size_t nprobe) {
         if (nprobe == 0) {
             throw std::invalid_argument("nprobe must be > 0");
         }
         params_.nprobe = nprobe;
+    }
+
+    void set_nrefine(std::size_t nrefine) {
+        if (nrefine > 0 && !params_.store_raw) {
+            throw std::invalid_argument(
+                "tinyann::IvfPqIndex::set_nrefine: nrefine > 0 requires store_raw=true");
+        }
+        params_.nrefine = nrefine;
     }
 
     /// Train coarse IVF centroids and PQ codebooks on residuals. Clears any vectors.
@@ -2592,6 +2603,9 @@ public:
         list_of_.push_back(list);
         lists_[list].push_back(node);
         codes_.insert(codes_.end(), code.begin(), code.end());
+        if (params_.store_raw) {
+            raw_data_.insert(raw_data_.end(), vector.begin(), vector.end());
+        }
     }
 
     bool remove(std::int64_t id) {
@@ -2632,6 +2646,10 @@ public:
             list_of_[i] = new_list;
             lists_[new_list].push_back(static_cast<int>(i));
             encode_residual(vp, new_list, codes_.data() + i * params_.M);
+            if (params_.store_raw) {
+                std::copy(vector.begin(), vector.end(),
+                          raw_data_.begin() + static_cast<std::ptrdiff_t>(i * dimension_));
+            }
             updated = true;
         }
         return updated;
@@ -2656,11 +2674,24 @@ public:
     }
 
     std::vector<SearchResult> search(const std::vector<float>& query, std::size_t k) const {
-        return search(query, k, [](std::int64_t) { return true; });
+        return search(query, k, params_.nrefine, [](std::int64_t) { return true; });
+    }
+
+    std::vector<SearchResult> search(const std::vector<float>& query, std::size_t k,
+                                     std::size_t nrefine) const {
+        return search(query, k, nrefine, [](std::int64_t) { return true; });
     }
 
     template <typename Pred>
     auto search(const std::vector<float>& query, std::size_t k, Pred predicate) const
+        -> std::enable_if_t<std::is_invocable_r<bool, Pred&, std::int64_t>::value,
+                            std::vector<SearchResult>> {
+        return search(query, k, params_.nrefine, std::move(predicate));
+    }
+
+    template <typename Pred>
+    auto search(const std::vector<float>& query, std::size_t k, std::size_t nrefine,
+                Pred predicate) const
         -> std::enable_if_t<std::is_invocable_r<bool, Pred&, std::int64_t>::value,
                             std::vector<SearchResult>> {
         if (query.size() != dimension_) {
@@ -2672,89 +2703,39 @@ public:
         if (!trained_ || k == 0 || empty()) {
             return {};
         }
-
-        // Cosine: search on unit query (matches train/add normalization).
-        const float* qp = query.data();
-        std::vector<float> q_unit;
-        if (metric_ == Metric::Cosine) {
-            q_unit = query;
-            l2_normalize_inplace(q_unit.data());
-            qp = q_unit.data();
+        if (nrefine > 0 && raw_data_.size() != ids_.size() * dimension_) {
+            throw std::invalid_argument(
+                "tinyann::IvfPqIndex::search: nrefine > 0 requires store_raw vectors");
         }
 
-        const std::size_t nprobe = std::min(params_.nprobe, params_.nlist);
-        auto lists = probe_lists(qp, nprobe);
-
-        std::vector<SearchResult> eligible;
-        eligible.reserve(k * 4);
-
-        // ADC tables: M * kSub floats (rebuilt per probed list because residual depends on
-        // the coarse centroid).
-        std::vector<float> table(params_.M * kSub);
-        std::vector<float> residual(dimension_);
-        std::vector<float> recon(dimension_);
-
-        for (std::size_t li : lists) {
-            if (metric_ == Metric::Cosine) {
-                // Rank by true cosine(q_unit, reconstruct(code)) — same definition as Index.
-                for (int node : lists_[li]) {
-                    const std::int64_t id = ids_[static_cast<std::size_t>(node)];
-                    if (!predicate(id)) {
-                        continue;
-                    }
-                    const std::uint8_t* code =
-                        codes_.data() + static_cast<std::size_t>(node) * params_.M;
-                    reconstruct_from_code(li, code, recon.data());
-                    eligible.push_back(
-                        SearchResult{id, cosine_similarity(qp, recon.data(), dimension_)});
-                }
-            } else {
-                // IP / Euclidean: asymmetric distance computation (no full float corpus).
-                build_adc_table(qp, li, residual.data(), table.data());
-                const float list_base = list_base_score(qp, li);
-                for (int node : lists_[li]) {
-                    const std::int64_t id = ids_[static_cast<std::size_t>(node)];
-                    if (!predicate(id)) {
-                        continue;
-                    }
-                    const std::uint8_t* code =
-                        codes_.data() + static_cast<std::size_t>(node) * params_.M;
-                    eligible.push_back(
-                        SearchResult{id, list_base + adc_from_table(code, table.data())});
-                }
-            }
-        }
-        if (eligible.empty()) {
+        const std::size_t R = (nrefine > 0) ? std::max(k, nrefine) : k;
+        auto cands = search_approx(query, R, predicate);
+        if (cands.empty()) {
             return {};
         }
-
-        const std::size_t take = std::min(k, eligible.size());
-        const bool hib = higher_is_better(metric_);
-        auto better = [hib](const SearchResult& a, const SearchResult& b) {
-            if (a.score != b.score) {
-                return hib ? (a.score > b.score) : (a.score < b.score);
+        if (nrefine > 0) {
+            for (auto& c : cands) {
+                const float* raw =
+                    raw_data_.data() + static_cast<std::size_t>(c.node) * dimension_;
+                c.score = metric_score(metric_, query.data(), raw, dimension_);
             }
-            return a.id < b.id;
-        };
-        if (take < eligible.size()) {
-            std::partial_sort(eligible.begin(),
-                              eligible.begin() + static_cast<std::ptrdiff_t>(take), eligible.end(),
-                              better);
-            eligible.resize(take);
-        } else {
-            std::sort(eligible.begin(), eligible.end(), better);
         }
-        return eligible;
+        return take_topk_from_cands(cands, k);
     }
 
     double recall_at_k_vs(const Index& exact, const std::vector<std::vector<float>>& queries,
                           std::size_t k) const {
+        return recall_at_k_vs(exact, queries, k, params_.nrefine);
+    }
+
+    double recall_at_k_vs(const Index& exact, const std::vector<std::vector<float>>& queries,
+                          std::size_t k, std::size_t nrefine) const {
         if (queries.empty()) {
             return 1.0;
         }
         double sum = 0.0;
         for (const auto& q : queries) {
-            sum += tinyann::recall_at_k(search(q, k), exact.search(q, k));
+            sum += tinyann::recall_at_k(search(q, k, nrefine), exact.search(q, k));
         }
         return sum / static_cast<double>(queries.size());
     }
@@ -2763,12 +2744,20 @@ public:
     auto recall_at_k_vs(const Index& exact, const std::vector<std::vector<float>>& queries,
                         std::size_t k, Pred predicate) const
         -> std::enable_if_t<std::is_invocable_r<bool, Pred&, std::int64_t>::value, double> {
+        return recall_at_k_vs(exact, queries, k, params_.nrefine, std::move(predicate));
+    }
+
+    template <typename Pred>
+    auto recall_at_k_vs(const Index& exact, const std::vector<std::vector<float>>& queries,
+                        std::size_t k, std::size_t nrefine, Pred predicate) const
+        -> std::enable_if_t<std::is_invocable_r<bool, Pred&, std::int64_t>::value, double> {
         if (queries.empty()) {
             return 1.0;
         }
         double sum = 0.0;
         for (const auto& q : queries) {
-            sum += tinyann::recall_at_k(search(q, k, predicate), exact.search(q, k, predicate));
+            sum += tinyann::recall_at_k(search(q, k, nrefine, predicate),
+                                        exact.search(q, k, predicate));
         }
         return sum / static_cast<double>(queries.size());
     }
@@ -2793,6 +2782,8 @@ public:
         detail::write_pod(out, params_.seed);
         detail::write_pod(out, static_cast<std::uint8_t>(params_.use_opq ? 1 : 0));
         detail::write_pod(out, static_cast<std::uint64_t>(params_.opq_iters));
+        detail::write_pod(out, static_cast<std::uint8_t>(params_.store_raw ? 1 : 0));
+        detail::write_pod(out, static_cast<std::uint64_t>(params_.nrefine));
 
         if (!ids_.empty()) {
             detail::write_bytes(out, ids_.data(), ids_.size() * sizeof(std::int64_t));
@@ -2816,6 +2807,9 @@ public:
                 throw std::runtime_error("tinyann::IvfPqIndex::save: missing OPQ matrix");
             }
             detail::write_bytes(out, opq_R_.data(), opq_R_.size() * sizeof(float));
+        }
+        if (params_.store_raw && !raw_data_.empty()) {
+            detail::write_bytes(out, raw_data_.data(), raw_data_.size() * sizeof(float));
         }
     }
 
@@ -2843,6 +2837,13 @@ public:
         params.use_opq = (detail::read_pod<std::uint8_t>(in) != 0);
         params.opq_iters =
             detail::size_from_u64(detail::read_pod<std::uint64_t>(in), "ivfpq opq_iters");
+        params.store_raw = (detail::read_pod<std::uint8_t>(in) != 0);
+        params.nrefine =
+            detail::size_from_u64(detail::read_pod<std::uint64_t>(in), "ivfpq nrefine");
+        if (params.nrefine > 0 && !params.store_raw) {
+            throw std::runtime_error(
+                "tinyann::IvfPqIndex::load: corrupt (nrefine > 0 without store_raw)");
+        }
 
         IvfPqIndex idx(dimension, metric, params);
         const std::size_t dsub = dimension / params.M;
@@ -2896,6 +2897,16 @@ public:
             detail::read_bytes(in, idx.opq_R_.data(),
                                detail::checked_mul_size(nR, sizeof(float), "ivfpq OPQ bytes"));
         }
+        if (params.store_raw) {
+            const std::size_t n_raw =
+                detail::checked_mul_size(count, dimension, "ivfpq raw floats");
+            idx.raw_data_.resize(n_raw);
+            if (n_raw > 0) {
+                detail::read_bytes(
+                    in, idx.raw_data_.data(),
+                    detail::checked_mul_size(n_raw, sizeof(float), "ivfpq raw bytes"));
+            }
+        }
 
         idx.validate_loaded();
         idx.rebuild_lists_from_list_of();
@@ -2909,8 +2920,15 @@ public:
     const std::vector<std::int64_t>& ids() const noexcept { return ids_; }
     const std::vector<std::uint8_t>& codes() const noexcept { return codes_; }
     const std::vector<float>& opq_matrix() const noexcept { return opq_R_; }
+    const std::vector<float>& raw_data() const noexcept { return raw_data_; }
 
 private:
+    struct Cand {
+        std::int64_t id;
+        int node;
+        float score;
+    };
+
     void validate_ctor() {
         if (dimension_ == 0) {
             throw std::invalid_argument("tinyann::IvfPqIndex: dimension must be > 0");
@@ -2932,6 +2950,10 @@ private:
                 "tinyann::IvfPqIndex: dimension must be divisible by M (got dim=" +
                 std::to_string(dimension_) + ", M=" + std::to_string(params_.M) + ")");
         }
+        if (params_.nrefine > 0 && !params_.store_raw) {
+            throw std::invalid_argument(
+                "tinyann::IvfPqIndex: nrefine > 0 requires store_raw = true");
+        }
     }
 
     void clear_data() {
@@ -2942,7 +2964,102 @@ private:
         centroids_.clear();
         codebooks_.clear();
         opq_R_.clear();
+        raw_data_.clear();
         trained_ = false;
+    }
+
+    template <typename Pred>
+    std::vector<Cand> search_approx(const std::vector<float>& query, std::size_t limit,
+                                    Pred predicate) const {
+        const float* qp = query.data();
+        std::vector<float> q_unit;
+        if (metric_ == Metric::Cosine) {
+            q_unit = query;
+            l2_normalize_inplace(q_unit.data());
+            qp = q_unit.data();
+        }
+        const std::size_t nprobe = std::min(params_.nprobe, params_.nlist);
+        auto lists = probe_lists(qp, nprobe);
+        std::vector<Cand> eligible;
+        eligible.reserve(limit * 4);
+        std::vector<float> table(params_.M * kSub);
+        std::vector<float> residual(dimension_);
+        std::vector<float> recon(dimension_);
+        for (std::size_t li : lists) {
+            if (metric_ == Metric::Cosine) {
+                for (int node : lists_[li]) {
+                    const std::int64_t id = ids_[static_cast<std::size_t>(node)];
+                    if (!predicate(id)) {
+                        continue;
+                    }
+                    const std::uint8_t* code =
+                        codes_.data() + static_cast<std::size_t>(node) * params_.M;
+                    reconstruct_from_code(li, code, recon.data());
+                    eligible.push_back(
+                        Cand{id, node, cosine_similarity(qp, recon.data(), dimension_)});
+                }
+            } else {
+                build_adc_table(qp, li, residual.data(), table.data());
+                const float list_base = list_base_score(qp, li);
+                for (int node : lists_[li]) {
+                    const std::int64_t id = ids_[static_cast<std::size_t>(node)];
+                    if (!predicate(id)) {
+                        continue;
+                    }
+                    const std::uint8_t* code =
+                        codes_.data() + static_cast<std::size_t>(node) * params_.M;
+                    eligible.push_back(
+                        Cand{id, node, list_base + adc_from_table(code, table.data())});
+                }
+            }
+        }
+        if (eligible.empty()) {
+            return {};
+        }
+        const std::size_t take = std::min(limit, eligible.size());
+        const bool hib = higher_is_better(metric_);
+        auto better = [hib](const Cand& a, const Cand& b) {
+            if (a.score != b.score) {
+                return hib ? (a.score > b.score) : (a.score < b.score);
+            }
+            return a.id < b.id;
+        };
+        if (take < eligible.size()) {
+            std::partial_sort(eligible.begin(),
+                              eligible.begin() + static_cast<std::ptrdiff_t>(take), eligible.end(),
+                              better);
+            eligible.resize(take);
+        } else {
+            std::sort(eligible.begin(), eligible.end(), better);
+        }
+        return eligible;
+    }
+
+    std::vector<SearchResult> take_topk_from_cands(std::vector<Cand>& cands, std::size_t k) const {
+        if (cands.empty() || k == 0) {
+            return {};
+        }
+        const std::size_t take = std::min(k, cands.size());
+        const bool hib = higher_is_better(metric_);
+        auto better = [hib](const Cand& a, const Cand& b) {
+            if (a.score != b.score) {
+                return hib ? (a.score > b.score) : (a.score < b.score);
+            }
+            return a.id < b.id;
+        };
+        if (take < cands.size()) {
+            std::partial_sort(cands.begin(), cands.begin() + static_cast<std::ptrdiff_t>(take),
+                              cands.end(), better);
+            cands.resize(take);
+        } else {
+            std::sort(cands.begin(), cands.end(), better);
+        }
+        std::vector<SearchResult> out;
+        out.reserve(cands.size());
+        for (const auto& c : cands) {
+            out.push_back(SearchResult{c.id, c.score});
+        }
+        return out;
     }
 
     void set_identity_opq() {
@@ -3540,6 +3657,17 @@ private:
             lists_[list_of_[static_cast<std::size_t>(idx)]].push_back(idx);
         }
 
+        if (params_.store_raw && raw_data_.size() == static_cast<std::size_t>(n) * dimension_) {
+            if (idx != last) {
+                std::copy(
+                    raw_data_.begin() + static_cast<std::ptrdiff_t>(last * static_cast<int>(dimension_)),
+                    raw_data_.begin() +
+                        static_cast<std::ptrdiff_t>((last + 1) * static_cast<int>(dimension_)),
+                    raw_data_.begin() + static_cast<std::ptrdiff_t>(idx * static_cast<int>(dimension_)));
+            }
+            raw_data_.resize(static_cast<std::size_t>(last) * dimension_);
+        }
+
         ids_.pop_back();
         list_of_.pop_back();
         codes_.resize(ids_.size() * params_.M);
@@ -3568,6 +3696,13 @@ private:
             }
         } else if (!opq_R_.empty()) {
             throw std::runtime_error("tinyann::IvfPqIndex::load: unexpected OPQ matrix");
+        }
+        if (params_.store_raw) {
+            if (raw_data_.size() != n * dimension_) {
+                throw std::runtime_error("tinyann::IvfPqIndex::load: raw_data size mismatch");
+            }
+        } else if (!raw_data_.empty()) {
+            throw std::runtime_error("tinyann::IvfPqIndex::load: unexpected raw_data");
         }
         for (std::size_t i = 0; i < n; ++i) {
             if (list_of_[i] >= params_.nlist) {
@@ -3616,6 +3751,7 @@ private:
     std::vector<std::size_t> list_of_;
     std::vector<std::uint8_t> codes_;  // n * M
     std::vector<float> opq_R_;         // optional dim*dim row-major orthogonal matrix
+    std::vector<float> raw_data_;      // optional n*dim original floats for re-rank
 };
 
 }  // namespace tinyann

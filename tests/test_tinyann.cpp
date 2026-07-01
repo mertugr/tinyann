@@ -1879,6 +1879,74 @@ void test_ivfpq_save_load() {
     CHECK(results_byte_identical(before, loaded.search(q, 8)));
 }
 
+void test_ivfpq_refine_improves_recall() {
+    const std::size_t dim = 64;
+    const std::size_t n = 2000;
+    const std::size_t nq = 40;
+    const std::size_t k = 10;
+    tinyann::IvfPqParams p;
+    p.nlist = 40;
+    p.nprobe = 12;
+    p.M = 8;
+    p.kmeans_iters = 20;
+    p.pq_kmeans_iters = 20;
+    p.seed = 42;
+    p.store_raw = true;
+    p.nrefine = 0;
+
+    tinyann::Index exact(dim, tinyann::Metric::InnerProduct);
+    tinyann::IvfPqIndex ivfpq(dim, tinyann::Metric::InnerProduct, p);
+    std::mt19937_64 rng(7);
+    std::vector<std::vector<float>> all;
+    for (std::size_t i = 0; i < n; ++i) {
+        all.push_back(random_unit_vector(dim, rng));
+    }
+    ivfpq.train(all);
+    for (std::size_t i = 0; i < n; ++i) {
+        exact.add(static_cast<std::int64_t>(i), all[i]);
+        ivfpq.add(static_cast<std::int64_t>(i), all[i]);
+    }
+    CHECK(ivfpq.stores_raw());
+
+    std::vector<std::vector<float>> queries;
+    for (std::size_t i = 0; i < nq; ++i) {
+        queries.push_back(random_unit_vector(dim, rng));
+    }
+
+    const double rec_plain = ivfpq.recall_at_k_vs(exact, queries, k, /*nrefine=*/0);
+    const double rec_ref = ivfpq.recall_at_k_vs(exact, queries, k, /*nrefine=*/80);
+    std::cout << "recall@10[ivfpq_plain]=" << rec_plain << " refine80=" << rec_ref << "\n";
+    CHECK(rec_ref + 1e-12 >= rec_plain);
+    CHECK(rec_ref > rec_plain + 0.05);
+    CHECK(rec_ref > 0.55);
+
+    const auto refined = ivfpq.search(queries[0], k, /*nrefine=*/80);
+    CHECK(refined.size() == k);
+    for (const auto& hit : refined) {
+        std::size_t node = 0;
+        while (node < ivfpq.ids().size() && ivfpq.ids()[node] != hit.id) {
+            ++node;
+        }
+        CHECK(node < ivfpq.ids().size());
+        const float* raw = ivfpq.raw_data().data() + node * dim;
+        CHECK_NEAR(hit.score, tinyann::inner_product(queries[0].data(), raw, dim), 1e-4);
+    }
+
+    bool threw = false;
+    tinyann::IvfPqParams p2 = p;
+    p2.store_raw = false;
+    p2.nrefine = 0;
+    tinyann::IvfPqIndex no_raw(dim, tinyann::Metric::InnerProduct, p2);
+    no_raw.train(all);
+    no_raw.add(0, all[0]);
+    try {
+        (void)no_raw.search(queries[0], 1, /*nrefine=*/10);
+    } catch (const std::invalid_argument&) {
+        threw = true;
+    }
+    CHECK(threw);
+}
+
 void test_ivfpq_opq_basic_and_save_load() {
     const std::size_t dim = 32;
     tinyann::IvfPqParams p;
@@ -2065,6 +2133,7 @@ int main() {
     test_ivfpq_cosine_scale_invariant();
     test_ivfpq_recall();
     test_ivfpq_save_load();
+    test_ivfpq_refine_improves_recall();
     test_ivfpq_opq_basic_and_save_load();
     test_ivfpq_remove_update();
     test_sq_quantize_dequantize();
