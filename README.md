@@ -114,10 +114,14 @@ tinyann::IvfPqParams pp;
 pp.nlist = 100;
 pp.nprobe = 10;
 pp.M = 8;  // dim must be divisible by M; stores M bytes per vector
+// Optional exact re-rank: keep raw floats and re-score a shortlist with metric_score
+pp.store_raw = true;
+pp.nrefine = 64;  // shortlist size; 0 = PQ-only scores
 tinyann::IvfPqIndex ivfpq(dim, tinyann::Metric::Cosine, pp);
 ivfpq.train(training_vectors);
 ivfpq.add(1, vec);
-auto phits = ivfpq.search(query, 10);
+auto phits = ivfpq.search(query, 10);           // uses params.nrefine
+auto phits2 = ivfpq.search(query, 10, /*nrefine=*/128);
 ivfpq.save("corpus.ivfpq.tann");
 auto loaded = tinyann::IvfPqIndex::load("corpus.ivfpq.tann");
 ```
@@ -163,6 +167,10 @@ Header-only: link the `tinyann` CMake interface target (or add `include/`).
 ./build/tinyann --dim 64 --metric cosine --vectors my_vectors.txt \
   --query my_query.txt --k 10 --index ivfpq --nlist 100 --nprobe 10 --pq-m 8 --recall
 
+# IVFPQ + exact re-rank (keeps raw floats; re-scores shortlist of 64)
+./build/tinyann --dim 64 --metric cosine --vectors my_vectors.txt \
+  --query my_query.txt --k 10 --index ivfpq --pq-m 8 --store-raw --nrefine 64 --recall
+
 # Benchmark exact vs HNSW vs IVF (synthetic unit vectors)
 ./build/tinyann --bench --dim 64 --n 20000 --nq 200 --k 10 \
   --metric cosine --ef 64 --M 16 --efc 200 --nlist 100 --nprobe 10
@@ -174,7 +182,7 @@ Vector file: optional integer `<id>` then `<f1> … <fN>` per line (`#` comments
 
 Binary format: magic `TANN`, version, kind (`exact` / `hnsw` / `ivf` / `sq` / `ivfpq`), metric, dimension, ids, vectors (or PQ codes for IVFPQ); HNSW also stores params, entry point, levels, adjacency lists, and RNG state. **Host-endian only** — files are not portable across different-endian machines (no endian marker in the header).
 
-**IVFPQ notes:** residual product quantization (encode `x - coarse_centroid`). **Euclidean:** approx squared residual L2 via ADC. **Inner product:** asymmetric IP ADC (`IP(q,c)+IP(q,decode)`). **Cosine:** train/add/search L2-normalize (scale-invariant, same spirit as true cosine elsewhere in tinyann); scores are `cosine_similarity(query, reconstruct(code))`. Best for large static-ish corpora; train once, then `add` / `search` / `save` / `load`.
+**IVFPQ notes:** residual product quantization (encode `x - coarse_centroid`). **Euclidean:** approx squared residual L2 via ADC. **Inner product:** asymmetric IP ADC. **Cosine:** normalize for PQ path; approx scores use reconstruct cosine. **Re-rank:** with `store_raw` + `nrefine>0`, stage-1 shortlist of `max(k,nrefine)` is re-scored with exact `metric_score` on original floats (same Cosine/IP/L2 as `Index`). Default is compressed-only (`store_raw=false`, `nrefine=0`).
 
 ### API notes (from design review)
 

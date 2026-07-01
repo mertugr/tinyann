@@ -1879,6 +1879,88 @@ void test_ivfpq_save_load() {
     CHECK(results_byte_identical(before, loaded.search(q, 8)));
 }
 
+void test_ivfpq_refine_improves_recall() {
+    const std::size_t dim = 64;
+    const std::size_t n = 2000;
+    const std::size_t nq = 40;
+    const std::size_t k = 10;
+    tinyann::IvfPqParams p;
+    p.nlist = 40;
+    p.nprobe = 12;  // coarser list probe so refine can help
+    p.M = 8;        // stronger compression → weaker approx
+    p.kmeans_iters = 20;
+    p.pq_kmeans_iters = 20;
+    p.seed = 42;
+    p.store_raw = true;
+    p.nrefine = 0;
+
+    tinyann::Index exact(dim, tinyann::Metric::InnerProduct);
+    tinyann::IvfPqIndex ivfpq(dim, tinyann::Metric::InnerProduct, p);
+    std::mt19937_64 rng(7);
+    std::vector<std::vector<float>> all;
+    for (std::size_t i = 0; i < n; ++i) {
+        all.push_back(random_unit_vector(dim, rng));
+    }
+    ivfpq.train(all);
+    for (std::size_t i = 0; i < n; ++i) {
+        exact.add(static_cast<std::int64_t>(i), all[i]);
+        ivfpq.add(static_cast<std::int64_t>(i), all[i]);
+    }
+    CHECK(ivfpq.stores_raw());
+
+    std::vector<std::vector<float>> queries;
+    for (std::size_t i = 0; i < nq; ++i) {
+        queries.push_back(random_unit_vector(dim, rng));
+    }
+
+    const double rec_plain = ivfpq.recall_at_k_vs(exact, queries, k, /*nrefine=*/0);
+    const double rec_ref = ivfpq.recall_at_k_vs(exact, queries, k, /*nrefine=*/80);
+    std::cout << "recall@10[ivfpq_plain]=" << rec_plain << " refine80=" << rec_ref << "\n";
+    CHECK(rec_ref + 1e-12 >= rec_plain);  // refine must not hurt recall
+    CHECK(rec_ref > rec_plain + 0.05);    // meaningful lift when shortlist catches true NNs
+    CHECK(rec_ref > 0.55);
+
+    // Refined scores must match exact metric on the same ids for a single query.
+    const auto refined = ivfpq.search(queries[0], k, /*nrefine=*/80);
+    CHECK(refined.size() == k);
+    for (const auto& hit : refined) {
+        // Find raw vector by scanning ids (unique in this test).
+        std::size_t node = 0;
+        while (node < ivfpq.ids().size() && ivfpq.ids()[node] != hit.id) {
+            ++node;
+        }
+        CHECK(node < ivfpq.ids().size());
+        const float* raw = ivfpq.raw_data().data() + node * dim;
+        const float expected =
+            tinyann::inner_product(queries[0].data(), raw, dim);
+        CHECK_NEAR(hit.score, expected, 1e-4);
+    }
+
+    // nrefine without raw must throw.
+    tinyann::IvfPqParams p2 = p;
+    p2.store_raw = false;
+    p2.nrefine = 0;
+    tinyann::IvfPqIndex no_raw(dim, tinyann::Metric::InnerProduct, p2);
+    no_raw.train(all);
+    no_raw.add(0, all[0]);
+    bool threw = false;
+    try {
+        (void)no_raw.search(queries[0], 1, /*nrefine=*/10);
+    } catch (const std::invalid_argument&) {
+        threw = true;
+    }
+    CHECK(threw);
+
+    // Save/load preserves raw + refine.
+    const std::string path = temp_path("tinyann_ivfpq_refine.bin");
+    ivfpq.set_nrefine(80);
+    ivfpq.save(path);
+    auto loaded = tinyann::IvfPqIndex::load(path);
+    CHECK(loaded.stores_raw());
+    CHECK(loaded.params().nrefine == 80);
+    CHECK(results_byte_identical(ivfpq.search(queries[0], k), loaded.search(queries[0], k)));
+}
+
 void test_ivfpq_remove_update() {
     tinyann::IvfPqParams p;
     p.nlist = 4;
@@ -2003,6 +2085,7 @@ int main() {
     test_ivfpq_cosine_scale_invariant();
     test_ivfpq_recall();
     test_ivfpq_save_load();
+    test_ivfpq_refine_improves_recall();
     test_ivfpq_remove_update();
     test_sq_quantize_dequantize();
     test_index_sq_search_and_recall();

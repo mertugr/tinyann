@@ -44,6 +44,8 @@ void print_usage(const char* argv0) {
         << "  --pq-m N          IVFPQ number of subquantizers M; dim must be divisible by M\n"
         << "                    (default: 8)\n"
         << "  --pq-iters N      IVFPQ per-subspace k-means iterations (default: 25)\n"
+        << "  --store-raw       IVFPQ: keep original floats for exact re-rank (more RAM)\n"
+        << "  --nrefine N       IVFPQ: re-rank shortlist size (0=off; requires --store-raw)\n"
         << "  --save PATH       Write built/loaded index to PATH (binary)\n"
         << "  --load PATH       Load index from PATH instead of --vectors\n"
         << "  --allow-ids FILE  Filtered search: only ids listed in FILE (one int64 per line)\n"
@@ -72,6 +74,8 @@ struct Options {
     std::size_t nprobe = 10;
     std::size_t pq_m = 8;
     std::size_t pq_iters = 25;
+    bool store_raw = false;
+    std::size_t nrefine = 0;
     std::string save_path;
     std::string load_path;
     std::string allow_ids_path;
@@ -152,6 +156,12 @@ bool parse_args(int argc, char** argv, Options& opt) {
             const char* v = need("--pq-iters");
             if (!v) return false;
             opt.pq_iters = static_cast<std::size_t>(std::stoull(v));
+        } else if (arg == "--store-raw") {
+            opt.store_raw = true;
+        } else if (arg == "--nrefine") {
+            const char* v = need("--nrefine");
+            if (!v) return false;
+            opt.nrefine = static_cast<std::size_t>(std::stoull(v));
         } else if (arg == "--save") {
             const char* v = need("--save");
             if (!v) return false;
@@ -632,6 +642,8 @@ int main(int argc, char** argv) {
                 ip.M = opt.pq_m;
                 ip.pq_kmeans_iters = opt.pq_iters;
                 ip.seed = opt.seed;
+                ip.store_raw = opt.store_raw;
+                ip.nrefine = opt.nrefine;
                 tinyann::IvfPqIndex built(opt.dim, opt.metric, ip);
                 built.train(ivfpq_data.vectors);
                 for (std::size_t i = 0; i < ivfpq_data.ids.size(); ++i) {
@@ -639,15 +651,20 @@ int main(int argc, char** argv) {
                 }
                 return built;
             }();
+            if (loading && opt.nrefine != 0) {
+                ivfpq.set_nrefine(opt.nrefine);
+            }
             if (!opt.save_path.empty()) {
                 ivfpq.save(opt.save_path);
                 std::cerr << "saved ivfpq index to " << opt.save_path << "\n";
             }
+            const std::size_t nrefine_use = opt.nrefine != 0 ? opt.nrefine : ivfpq.params().nrefine;
             std::cerr << "index=ivfpq size=" << ivfpq.size() << " dim=" << ivfpq.dimension()
                       << " metric=" << tinyann::metric_name(ivfpq.metric()) << " k=" << opt.k
                       << " nlist=" << ivfpq.params().nlist << " nprobe=" << ivfpq.params().nprobe
                       << " M=" << ivfpq.params().M << " code_bytes=" << ivfpq.code_size()
-                      << (filtered ? " filtered=1" : "") << "\n";
+                      << " store_raw=" << (ivfpq.stores_raw() ? 1 : 0)
+                      << " nrefine=" << nrefine_use << (filtered ? " filtered=1" : "") << "\n";
             if (!opt.query_path.empty()) {
                 std::vector<std::vector<float>> queries;
                 if (!load_queries(opt.query_path, ivfpq.dimension(), queries)) {
@@ -664,15 +681,17 @@ int main(int argc, char** argv) {
                         std::cout << "# query " << qi << "\n";
                     }
                     if (filtered) {
-                        print_hits(ivfpq.search(queries[qi], opt.k, pred));
+                        print_hits(ivfpq.search(queries[qi], opt.k, nrefine_use, pred));
                     } else {
-                        print_hits(ivfpq.search(queries[qi], opt.k));
+                        print_hits(ivfpq.search(queries[qi], opt.k, nrefine_use));
                     }
                 }
                 if (opt.measure_recall && exact_for_recall.size() > 0) {
                     const double rec =
-                        filtered ? ivfpq.recall_at_k_vs(exact_for_recall, queries, opt.k, pred)
-                                 : ivfpq.recall_at_k_vs(exact_for_recall, queries, opt.k);
+                        filtered
+                            ? ivfpq.recall_at_k_vs(exact_for_recall, queries, opt.k, nrefine_use,
+                                                   pred)
+                            : ivfpq.recall_at_k_vs(exact_for_recall, queries, opt.k, nrefine_use);
                     std::cerr << "recall@" << opt.k << "=" << rec << " (ivfpq vs exact)\n";
                 }
             }
