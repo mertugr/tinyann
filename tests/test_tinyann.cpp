@@ -1708,6 +1708,204 @@ void test_hnsw_filtered_recall() {
     CHECK_NEAR(rec_all, rec_unf, 1e-12);
 }
 
+void test_ivfpq_cosine_scale_invariant() {
+    // Exact cosine prefers same direction over longer IP; unnormalized data must not
+    // make IVFPQ cosine behave like IP.
+    const std::size_t dim = 8;
+    tinyann::IvfPqParams p;
+    p.nlist = 2;
+    p.nprobe = 2;
+    p.M = 2;
+    p.kmeans_iters = 15;
+    p.pq_kmeans_iters = 15;
+    p.seed = 1;
+
+    // a: short, aligned with e0; b: long, 45° from e0 — cosine(q,a)=1 > cosine(q,b).
+    std::vector<float> a(dim, 0.f);
+    a[0] = 0.01f;
+    std::vector<float> b(dim, 0.f);
+    b[0] = 100.f;
+    b[1] = 100.f;
+    std::mt19937_64 rng(2);
+
+    std::vector<std::vector<float>> train = {a, b, random_unit_vector(dim, rng),
+                                             random_unit_vector(dim, rng),
+                                             random_unit_vector(dim, rng),
+                                             random_unit_vector(dim, rng)};
+    tinyann::IvfPqIndex cos_idx(dim, tinyann::Metric::Cosine, p);
+    cos_idx.train(train);
+    cos_idx.add(1, a);
+    cos_idx.add(2, b);
+
+    tinyann::Index exact(dim, tinyann::Metric::Cosine);
+    exact.add(1, a);
+    exact.add(2, b);
+
+    std::vector<float> q(dim, 0.f);
+    q[0] = 1.f;
+    const auto exact_hits = exact.search(q, 2);
+    CHECK(exact_hits[0].id == 1);  // cosine prefers short aligned a
+    CHECK_NEAR(exact_hits[0].score, 1.0, 1e-5);
+
+    tinyann::Index ip_idx(dim, tinyann::Metric::InnerProduct);
+    ip_idx.add(1, a);
+    ip_idx.add(2, b);
+    const auto ip_hits = ip_idx.search(q, 2);
+    CHECK(ip_hits[0].id == 2);  // IP prefers long b
+
+    const auto cos_hits = cos_idx.search(q, 2);
+    CHECK(cos_hits.size() == 2);
+    CHECK(cos_hits[0].id == 1);  // must match cosine, not IP
+    CHECK(cos_hits[0].score > cos_hits[1].score);
+}
+
+void test_ivfpq_rejects_bad_m() {
+    tinyann::IvfPqParams p;
+    p.M = 3;  // 32 % 3 != 0
+    bool threw = false;
+    try {
+        tinyann::IvfPqIndex idx(32, tinyann::Metric::Euclidean, p);
+        (void)idx;
+    } catch (const std::invalid_argument&) {
+        threw = true;
+    }
+    CHECK(threw);
+}
+
+void test_ivfpq_basic_search_and_filter() {
+    const std::size_t dim = 32;
+    tinyann::IvfPqParams p;
+    p.nlist = 8;
+    p.nprobe = 8;
+    p.M = 8;
+    p.kmeans_iters = 15;
+    p.pq_kmeans_iters = 15;
+    p.seed = 1;
+
+    tinyann::IvfPqIndex idx(dim, tinyann::Metric::InnerProduct, p);
+    std::mt19937_64 rng(9);
+    std::vector<std::vector<float>> all;
+    for (int i = 0; i < 200; ++i) {
+        all.push_back(random_unit_vector(dim, rng));
+    }
+    idx.train(all);
+    CHECK(idx.trained());
+    for (int i = 0; i < 200; ++i) {
+        idx.add(i, all[static_cast<std::size_t>(i)]);
+    }
+    CHECK(idx.size() == 200);
+    CHECK(idx.code_size() == 8);
+
+    auto r = idx.search(all[0], 5);
+    CHECK(r.size() == 5);
+    // Top-1 should usually be self for unit vectors + IP with full nprobe.
+    CHECK(r[0].id == 0);
+
+    auto none = idx.search(all[0], 5, [](std::int64_t) { return false; });
+    CHECK(none.empty());
+    auto even = idx.search(all[0], 10, [](std::int64_t id) { return id % 2 == 0; });
+    for (const auto& h : even) {
+        CHECK((h.id % 2) == 0);
+    }
+    CHECK(!even.empty());
+}
+
+void test_ivfpq_recall() {
+    // Moderate compression (M=16 → 16 B/vector on dim=64) + full list probe for quality check.
+    const std::size_t dim = 64;
+    const std::size_t n = 2500;
+    const std::size_t nq = 50;
+    const std::size_t k = 10;
+    tinyann::IvfPqParams p;
+    p.nlist = 40;
+    p.nprobe = 40;  // probe all lists → focus on PQ distance quality
+    p.M = 16;
+    p.kmeans_iters = 25;
+    p.pq_kmeans_iters = 25;
+    p.seed = 11;
+
+    for (auto metric : {tinyann::Metric::Cosine, tinyann::Metric::Euclidean,
+                        tinyann::Metric::InnerProduct}) {
+        tinyann::Index exact(dim, metric);
+        tinyann::IvfPqIndex ivfpq(dim, metric, p);
+        std::mt19937_64 rng(200 + static_cast<unsigned>(metric));
+        std::vector<std::vector<float>> all;
+        all.reserve(n);
+        for (std::size_t i = 0; i < n; ++i) {
+            all.push_back(random_unit_vector(dim, rng));
+        }
+        ivfpq.train(all);
+        for (std::size_t i = 0; i < n; ++i) {
+            exact.add(static_cast<std::int64_t>(i), all[i]);
+            ivfpq.add(static_cast<std::int64_t>(i), all[i]);
+        }
+        std::vector<std::vector<float>> queries;
+        for (std::size_t i = 0; i < nq; ++i) {
+            queries.push_back(random_unit_vector(dim, rng));
+        }
+        const double rec = ivfpq.recall_at_k_vs(exact, queries, k);
+        std::cout << "recall@10[ivfpq_" << tinyann::metric_name(metric) << "]=" << rec << "\n";
+        // Residual 8-bit PQ without re-rank is coarser than float IVF; M=16 + full nprobe
+        // should still recover a majority of true neighbors on unit-vector synthetic data.
+        CHECK(rec > 0.55);
+    }
+}
+
+void test_ivfpq_save_load() {
+    tinyann::IvfPqParams p;
+    p.nlist = 10;
+    p.nprobe = 5;
+    p.M = 4;
+    p.seed = 3;
+    const std::size_t dim = 16;
+    tinyann::IvfPqIndex idx(dim, tinyann::Metric::Cosine, p);
+    std::mt19937_64 rng(12);
+    std::vector<std::vector<float>> all;
+    for (int i = 0; i < 120; ++i) {
+        all.push_back(random_unit_vector(dim, rng));
+    }
+    idx.train(all);
+    for (int i = 0; i < 120; ++i) {
+        idx.add(i, all[static_cast<std::size_t>(i)]);
+    }
+    const auto q = random_unit_vector(dim, rng);
+    const auto before = idx.search(q, 8);
+    const std::string path = temp_path("tinyann_ivfpq.bin");
+    idx.save(path);
+    auto loaded = tinyann::IvfPqIndex::load(path);
+    CHECK(loaded.trained());
+    CHECK(loaded.size() == idx.size());
+    CHECK(loaded.params().M == idx.params().M);
+    CHECK(results_byte_identical(before, loaded.search(q, 8)));
+}
+
+void test_ivfpq_remove_update() {
+    tinyann::IvfPqParams p;
+    p.nlist = 4;
+    p.nprobe = 4;
+    p.M = 2;
+    p.seed = 5;
+    tinyann::IvfPqIndex idx(8, tinyann::Metric::InnerProduct, p);
+    std::mt19937_64 rng(1);
+    std::vector<std::vector<float>> all;
+    for (int i = 0; i < 40; ++i) {
+        all.push_back(random_unit_vector(8, rng));
+    }
+    idx.train(all);
+    for (int i = 0; i < 40; ++i) {
+        idx.add(i, all[static_cast<std::size_t>(i)]);
+    }
+    CHECK(idx.remove(7));
+    CHECK(!idx.contains(7));
+    CHECK(idx.size() == 39);
+    auto hits = idx.search(all[0], 5);
+    for (const auto& h : hits) {
+        CHECK(h.id != 7);
+    }
+    CHECK(idx.update(1, all[2]));
+    CHECK(idx.search(all[2], 1).size() == 1);
+}
+
 void test_remove_update_persist_roundtrip() {
     tinyann::Index exact(2, tinyann::Metric::Cosine);
     exact.add(1, {1.f, 0.f});
@@ -1800,6 +1998,12 @@ int main() {
     test_ivf_save_load();
     test_ivf_load_rejects_corrupt_lists();
     test_ivf_remove_update();
+    test_ivfpq_rejects_bad_m();
+    test_ivfpq_basic_search_and_filter();
+    test_ivfpq_cosine_scale_invariant();
+    test_ivfpq_recall();
+    test_ivfpq_save_load();
+    test_ivfpq_remove_update();
     test_sq_quantize_dequantize();
     test_index_sq_search_and_recall();
     test_index_sq_save_load();

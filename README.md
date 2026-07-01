@@ -13,6 +13,7 @@ Distance kernels use **SIMD** when available (AVX2 / SSE2 / ARM NEON, with scala
 - **Exact** brute-force k-NN (`Index`)
 - **Approximate** k-NN via **HNSW** (`HnswIndex`) — same metrics, tunable speed/recall
 - **Approximate** k-NN via **IVF** (`IvfIndex`) — FAISS-style: train k-means (`nlist`), probe `nprobe` lists, brute-force within
+- **IVF + Product Quantization (`IvfPqIndex`)** — compressed corpus: residual PQ codes (`M` bytes/vector, 8-bit subquantizers), ADC search; CLI `--index ivfpq --pq-m M`
 - **Scalar quantization (SQ int8)** — `tinyann::sq::quantize` / `dequantize`, `IndexSq` stores per-vector int8 codes + scale; CLI `--sq`
 - **`recall_at_k` / `HnswIndex::recall_at_k_vs`** to measure approx quality vs exact
 - Edge cases: empty index, `k == 0`, `k > n`, zero vectors (cosine → score `0`)
@@ -99,7 +100,7 @@ tinyann::IndexSq sq_index(dim, tinyann::Metric::Cosine);
 sq_index.add(1, vec);
 auto shits = sq_index.search(query, 10);
 
-// IVF (train then add — FAISS-like)
+// IVF (train then add — FAISS-like, full-float lists)
 tinyann::IvfParams ip;
 ip.nlist = 100;
 ip.nprobe = 10;
@@ -107,6 +108,18 @@ tinyann::IvfIndex ivf(dim, tinyann::Metric::Cosine, ip);
 ivf.train(training_vectors);
 ivf.add(1, vec);
 auto ihits = ivf.search(query, 10);
+
+// IVFPQ — large corpora in less RAM (residual product quantization)
+tinyann::IvfPqParams pp;
+pp.nlist = 100;
+pp.nprobe = 10;
+pp.M = 8;  // dim must be divisible by M; stores M bytes per vector
+tinyann::IvfPqIndex ivfpq(dim, tinyann::Metric::Cosine, pp);
+ivfpq.train(training_vectors);
+ivfpq.add(1, vec);
+auto phits = ivfpq.search(query, 10);
+ivfpq.save("corpus.ivfpq.tann");
+auto loaded = tinyann::IvfPqIndex::load("corpus.ivfpq.tann");
 ```
 
 Header-only: link the `tinyann` CMake interface target (or add `include/`).
@@ -146,6 +159,10 @@ Header-only: link the `tinyann` CMake interface target (or add `include/`).
 ./build/tinyann --dim 3 --metric cosine --vectors data/vectors.txt \
   --query data/query.txt --k 3 --index ivf --nlist 4 --nprobe 2 --recall
 
+# IVFPQ (dim must be divisible by --pq-m; sample data dim=3 needs M=1 or use higher-dim data)
+./build/tinyann --dim 64 --metric cosine --vectors my_vectors.txt \
+  --query my_query.txt --k 10 --index ivfpq --nlist 100 --nprobe 10 --pq-m 8 --recall
+
 # Benchmark exact vs HNSW vs IVF (synthetic unit vectors)
 ./build/tinyann --bench --dim 64 --n 20000 --nq 200 --k 10 \
   --metric cosine --ef 64 --M 16 --efc 200 --nlist 100 --nprobe 10
@@ -155,7 +172,9 @@ Benchmark prints build/search times, QPS, **speedup vs exact**, **recall@k** for
 
 Vector file: optional integer `<id>` then `<f1> … <fN>` per line (`#` comments / blanks ignored). The id is parsed as **int64 text** (not float); lines with only `N` floats get auto-assigned sequential ids.
 
-Binary format: magic `TANN`, version, kind (`exact` / `hnsw` / `ivf` / `sq`), metric, dimension, ids, vectors; HNSW also stores params, entry point, levels, adjacency lists, and RNG state. **Host-endian only** — files are not portable across different-endian machines (no endian marker in the header).
+Binary format: magic `TANN`, version, kind (`exact` / `hnsw` / `ivf` / `sq` / `ivfpq`), metric, dimension, ids, vectors (or PQ codes for IVFPQ); HNSW also stores params, entry point, levels, adjacency lists, and RNG state. **Host-endian only** — files are not portable across different-endian machines (no endian marker in the header).
+
+**IVFPQ notes:** residual product quantization (encode `x - coarse_centroid`). **Euclidean:** approx squared residual L2 via ADC. **Inner product:** asymmetric IP ADC (`IP(q,c)+IP(q,decode)`). **Cosine:** train/add/search L2-normalize (scale-invariant, same spirit as true cosine elsewhere in tinyann); scores are `cosine_similarity(query, reconstruct(code))`. Best for large static-ish corpora; train once, then `add` / `search` / `save` / `load`.
 
 ### API notes (from design review)
 

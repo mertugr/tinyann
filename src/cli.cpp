@@ -21,7 +21,8 @@ void print_usage(const char* argv0) {
         << "  Build from vectors + query:\n"
         << "    " << argv0 << " --dim N --metric M --vectors FILE --query FILE [options]\n"
         << "  Load saved index + query:\n"
-        << "    " << argv0 << " --load PATH --query FILE [--index exact|hnsw|ivf] [options]\n"
+        << "    " << argv0
+        << " --load PATH --query FILE [--index exact|hnsw|ivf|ivfpq] [options]\n"
         << "  Benchmark (synthetic data):\n"
         << "    " << argv0 << " --bench --dim N [--n N] [--nq N] [--k K] [--metric M]\n"
         << "                    [--ef N] [--M N] [--efc N] [--nlist N] [--nprobe N]\n"
@@ -32,14 +33,17 @@ void print_usage(const char* argv0) {
         << "  --vectors FILE    Text file: one vector per line: <id> <f1> <f2> ... <fN>\n"
         << "  --query FILE      Query vector file (optional if only --save)\n"
         << "  --k K             Number of nearest neighbors (default: 10)\n"
-        << "  --index TYPE      exact | brute | hnsw | approx | ivf  (default: exact)\n"
+        << "  --index TYPE      exact | brute | hnsw | approx | ivf | ivfpq  (default: exact)\n"
         << "  --sq              Store exact index vectors as int8 scalar-quantized codes\n"
         << "                    (only with --index exact; uses IndexSq)\n"
         << "  --ef N            HNSW ef_search candidate list size (default: 64)\n"
         << "  --M N             HNSW M (max links per layer; default: 16)\n"
         << "  --efc N           HNSW ef_construction (default: 200)\n"
-        << "  --nlist N         IVF number of coarse centroids / lists (default: 100)\n"
-        << "  --nprobe N        IVF lists probed at query time (default: 10)\n"
+        << "  --nlist N         IVF/IVFPQ number of coarse centroids / lists (default: 100)\n"
+        << "  --nprobe N        IVF/IVFPQ lists probed at query time (default: 10)\n"
+        << "  --pq-m N          IVFPQ number of subquantizers M; dim must be divisible by M\n"
+        << "                    (default: 8)\n"
+        << "  --pq-iters N      IVFPQ per-subspace k-means iterations (default: 25)\n"
         << "  --save PATH       Write built/loaded index to PATH (binary)\n"
         << "  --load PATH       Load index from PATH instead of --vectors\n"
         << "  --allow-ids FILE  Filtered search: only ids listed in FILE (one int64 per line)\n"
@@ -66,6 +70,8 @@ struct Options {
     std::size_t efc = 200;
     std::size_t nlist = 100;
     std::size_t nprobe = 10;
+    std::size_t pq_m = 8;
+    std::size_t pq_iters = 25;
     std::string save_path;
     std::string load_path;
     std::string allow_ids_path;
@@ -138,6 +144,14 @@ bool parse_args(int argc, char** argv, Options& opt) {
             const char* v = need("--nprobe");
             if (!v) return false;
             opt.nprobe = static_cast<std::size_t>(std::stoull(v));
+        } else if (arg == "--pq-m") {
+            const char* v = need("--pq-m");
+            if (!v) return false;
+            opt.pq_m = static_cast<std::size_t>(std::stoull(v));
+        } else if (arg == "--pq-iters") {
+            const char* v = need("--pq-iters");
+            if (!v) return false;
+            opt.pq_iters = static_cast<std::size_t>(std::stoull(v));
         } else if (arg == "--save") {
             const char* v = need("--save");
             if (!v) return false;
@@ -257,6 +271,10 @@ bool use_hnsw(const std::string& type) {
 }
 
 bool use_ivf(const std::string& type) { return type == "ivf"; }
+
+bool use_ivfpq(const std::string& type) {
+    return type == "ivfpq" || type == "ivf_pq" || type == "pq";
+}
 
 bool use_exact(const std::string& type) {
     return type == "exact" || type == "brute" || type == "bruteforce" || type == "bf";
@@ -494,9 +512,10 @@ int main(int argc, char** argv) {
         return run_bench(opt);
     }
 
-    if (!use_hnsw(opt.index_type) && !use_exact(opt.index_type) && !use_ivf(opt.index_type)) {
+    if (!use_hnsw(opt.index_type) && !use_exact(opt.index_type) && !use_ivf(opt.index_type) &&
+        !use_ivfpq(opt.index_type)) {
         std::cerr << "unknown --index type: " << opt.index_type
-                  << " (use exact|brute|hnsw|approx|ivf)\n";
+                  << " (use exact|brute|hnsw|approx|ivf|ivfpq)\n";
         return 2;
     }
 
@@ -586,6 +605,75 @@ int main(int argc, char** argv) {
                 if (opt.measure_recall && exact_for_recall.size() > 0) {
                     const double rec = index.recall_at_k_vs(exact_for_recall, queries, opt.k);
                     std::cerr << "recall@" << opt.k << "=" << rec << " (sq vs float exact)\n";
+                }
+            }
+            return 0;
+        }
+
+        if (use_ivfpq(opt.index_type)) {
+            LoadedData ivfpq_data;
+            if (!loading) {
+                if (!load_vectors_file(opt.vectors_path, opt.dim, ivfpq_data)) {
+                    return 1;
+                }
+            }
+            tinyann::IvfPqIndex ivfpq = [&]() -> tinyann::IvfPqIndex {
+                if (loading) {
+                    auto loaded = tinyann::IvfPqIndex::load(opt.load_path);
+                    std::cerr << "loaded ivfpq index from " << opt.load_path << "\n";
+                    if (opt.nprobe != 10) {
+                        loaded.set_nprobe(opt.nprobe);
+                    }
+                    return loaded;
+                }
+                tinyann::IvfPqParams ip;
+                ip.nlist = opt.nlist;
+                ip.nprobe = opt.nprobe;
+                ip.M = opt.pq_m;
+                ip.pq_kmeans_iters = opt.pq_iters;
+                ip.seed = opt.seed;
+                tinyann::IvfPqIndex built(opt.dim, opt.metric, ip);
+                built.train(ivfpq_data.vectors);
+                for (std::size_t i = 0; i < ivfpq_data.ids.size(); ++i) {
+                    built.add(ivfpq_data.ids[i], ivfpq_data.vectors[i]);
+                }
+                return built;
+            }();
+            if (!opt.save_path.empty()) {
+                ivfpq.save(opt.save_path);
+                std::cerr << "saved ivfpq index to " << opt.save_path << "\n";
+            }
+            std::cerr << "index=ivfpq size=" << ivfpq.size() << " dim=" << ivfpq.dimension()
+                      << " metric=" << tinyann::metric_name(ivfpq.metric()) << " k=" << opt.k
+                      << " nlist=" << ivfpq.params().nlist << " nprobe=" << ivfpq.params().nprobe
+                      << " M=" << ivfpq.params().M << " code_bytes=" << ivfpq.code_size()
+                      << (filtered ? " filtered=1" : "") << "\n";
+            if (!opt.query_path.empty()) {
+                std::vector<std::vector<float>> queries;
+                if (!load_queries(opt.query_path, ivfpq.dimension(), queries)) {
+                    return 1;
+                }
+                tinyann::Index exact_for_recall(ivfpq.dimension(), ivfpq.metric());
+                if (opt.measure_recall && !loading) {
+                    for (std::size_t i = 0; i < ivfpq_data.ids.size(); ++i) {
+                        exact_for_recall.add(ivfpq_data.ids[i], ivfpq_data.vectors[i]);
+                    }
+                }
+                for (std::size_t qi = 0; qi < queries.size(); ++qi) {
+                    if (queries.size() > 1) {
+                        std::cout << "# query " << qi << "\n";
+                    }
+                    if (filtered) {
+                        print_hits(ivfpq.search(queries[qi], opt.k, pred));
+                    } else {
+                        print_hits(ivfpq.search(queries[qi], opt.k));
+                    }
+                }
+                if (opt.measure_recall && exact_for_recall.size() > 0) {
+                    const double rec =
+                        filtered ? ivfpq.recall_at_k_vs(exact_for_recall, queries, opt.k, pred)
+                                 : ivfpq.recall_at_k_vs(exact_for_recall, queries, opt.k);
+                    std::cerr << "recall@" << opt.k << "=" << rec << " (ivfpq vs exact)\n";
                 }
             }
             return 0;

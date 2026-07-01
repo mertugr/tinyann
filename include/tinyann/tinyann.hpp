@@ -476,7 +476,8 @@ constexpr std::uint32_t kFormatVersion = 1;
 constexpr std::uint32_t kKindExact = 1;
 constexpr std::uint32_t kKindHnsw = 2;
 constexpr std::uint32_t kKindIvf = 3;
-constexpr std::uint32_t kKindSq = 4;  // exact index with int8 scalar quantization
+constexpr std::uint32_t kKindSq = 4;     // exact index with int8 scalar quantization
+constexpr std::uint32_t kKindIvfPq = 5;  // IVF + product quantization (compressed codes)
 
 inline void write_bytes(std::ostream& out, const void* data, std::size_t n) {
     out.write(reinterpret_cast<const char*>(data), static_cast<std::streamsize>(n));
@@ -2452,6 +2453,879 @@ private:
     std::vector<std::int64_t> ids_;
     std::vector<float> scales_;       // per-vector symmetric scale
     std::vector<std::int8_t> codes_;  // row-major int8
+};
+
+// ---------------------------------------------------------------------------
+// IVF + Product Quantization (IVFPQ) — FAISS-style compressed inverted index
+//
+// 1) train(): coarse k-means (nlist) + M independent subspace codebooks (ksub=256)
+//    on residuals to the coarse centroid (IVFADC residual PQ)
+// 2) add(): assign list, encode residual as M uint8 codes (no full-float storage)
+// 3) search(): probe nprobe lists; asymmetric distance computation (ADC) vs codes
+//
+// Memory: ~M bytes/vector + coarse centroids + M*256*(dim/M) floats for codebooks
+// ---------------------------------------------------------------------------
+
+/// Parameters for IVFPQ training and search.
+struct IvfPqParams {
+    /// Number of coarse centroids / inverted lists.
+    std::size_t nlist = 100;
+    /// Number of lists to probe at query time (1 .. nlist).
+    std::size_t nprobe = 10;
+    /// k-means iterations for the coarse quantizer.
+    std::size_t kmeans_iters = 25;
+    /// Number of PQ subquantizers (must divide dimension).
+    std::size_t M = 8;
+    /// k-means iterations per PQ subspace codebook.
+    std::size_t pq_kmeans_iters = 25;
+    /// RNG seed for coarse + PQ training.
+    std::uint64_t seed = 42;
+};
+
+/// In-memory IVF index with product-quantized residuals (compressed corpus).
+///
+/// Stores only M-byte codes per vector (plus inverted lists / centroids / codebooks).
+/// Suitable for large corpora where full-float IVF or HNSW RAM is prohibitive.
+/// Concurrent search is safe while the index is immutable (no concurrent train/add).
+///
+/// **Metrics (consistent with `Index` / `IvfIndex` / `HnswIndex`):**
+/// - **Euclidean:** residual L2 ADC (approx squared residual distance; lower better).
+/// - **InnerProduct:** asymmetric IP ADC on residual reconstruction (higher better).
+/// - **Cosine:** inputs are **L2-normalized** on train/add/update/search (scale-invariant
+///   like true cosine); ranking uses the IP ADC path on the unit sphere, then final
+///   hit scores are true `cosine_similarity(query, reconstruct(code))`.
+class IvfPqIndex {
+public:
+    /// Fixed 8-bit codes per subspace (FAISS default ksub = 256).
+    static constexpr std::size_t kSub = 256;
+
+    explicit IvfPqIndex(std::size_t dimension, Metric metric = Metric::Cosine,
+                        IvfPqParams params = {})
+        : dimension_(dimension), metric_(metric), params_(params) {
+        validate_ctor();
+    }
+
+    std::size_t dimension() const noexcept { return dimension_; }
+    Metric metric() const noexcept { return metric_; }
+    std::size_t size() const noexcept { return ids_.size(); }
+    bool empty() const noexcept { return ids_.empty(); }
+    bool trained() const noexcept { return trained_; }
+    const IvfPqParams& params() const noexcept { return params_; }
+    std::size_t code_size() const noexcept { return params_.M; }  // bytes per vector
+
+    void set_nprobe(std::size_t nprobe) {
+        if (nprobe == 0) {
+            throw std::invalid_argument("nprobe must be > 0");
+        }
+        params_.nprobe = nprobe;
+    }
+
+    /// Train coarse IVF centroids and PQ codebooks on residuals. Clears any vectors.
+    /// For `Metric::Cosine`, training vectors are L2-normalized (scale-invariant).
+    void train(const std::vector<std::vector<float>>& training) {
+        if (training.empty()) {
+            throw std::invalid_argument("tinyann::IvfPqIndex::train: empty training set");
+        }
+        for (const auto& v : training) {
+            if (v.size() != dimension_) {
+                throw std::invalid_argument("tinyann::IvfPqIndex::train: dimension mismatch");
+            }
+            require_finite(v, "tinyann::IvfPqIndex::train");
+        }
+
+        clear_data();
+        // Cosine: train on unit vectors so coarse/PQ geometry matches true cosine ranking.
+        const std::vector<std::vector<float>>* train_ptr = &training;
+        std::vector<std::vector<float>> train_unit;
+        if (metric_ == Metric::Cosine) {
+            train_unit = training;
+            for (auto& v : train_unit) {
+                l2_normalize_inplace(v.data());
+            }
+            train_ptr = &train_unit;
+        }
+        train_coarse(*train_ptr);
+        train_pq_codebooks(*train_ptr);
+        trained_ = true;
+    }
+
+    void add(std::int64_t id, const std::vector<float>& vector) {
+        if (!trained_) {
+            throw std::runtime_error("tinyann::IvfPqIndex::add: call train() first");
+        }
+        if (vector.size() != dimension_) {
+            throw std::invalid_argument(
+                "tinyann::IvfPqIndex::add: vector dimension mismatch (expected " +
+                std::to_string(dimension_) + ", got " + std::to_string(vector.size()) + ")");
+        }
+        require_finite(vector, "tinyann::IvfPqIndex::add");
+        if (ids_.size() >= static_cast<std::size_t>(std::numeric_limits<int>::max())) {
+            throw std::invalid_argument(
+                "tinyann::IvfPqIndex::add: maximum number of nodes (INT_MAX) reached");
+        }
+
+        const float* vp = vector.data();
+        std::vector<float> unit;
+        if (metric_ == Metric::Cosine) {
+            unit = vector;
+            l2_normalize_inplace(unit.data());
+            vp = unit.data();
+        }
+
+        const int node = static_cast<int>(ids_.size());
+        const std::size_t list = nearest_centroid(vp);
+        std::vector<std::uint8_t> code(params_.M);
+        encode_residual(vp, list, code.data());
+
+        ids_.push_back(id);
+        list_of_.push_back(list);
+        lists_[list].push_back(node);
+        codes_.insert(codes_.end(), code.begin(), code.end());
+    }
+
+    bool remove(std::int64_t id) {
+        bool removed = false;
+        for (int i = static_cast<int>(ids_.size()) - 1; i >= 0; --i) {
+            if (ids_[static_cast<std::size_t>(i)] == id) {
+                remove_node_at(i);
+                removed = true;
+            }
+        }
+        return removed;
+    }
+
+    bool update(std::int64_t id, const std::vector<float>& vector) {
+        if (vector.size() != dimension_) {
+            throw std::invalid_argument(
+                "tinyann::IvfPqIndex::update: vector dimension mismatch (expected " +
+                std::to_string(dimension_) + ", got " + std::to_string(vector.size()) + ")");
+        }
+        require_finite(vector, "tinyann::IvfPqIndex::update");
+        const float* vp = vector.data();
+        std::vector<float> unit;
+        if (metric_ == Metric::Cosine) {
+            unit = vector;
+            l2_normalize_inplace(unit.data());
+            vp = unit.data();
+        }
+        bool updated = false;
+        for (std::size_t i = 0; i < ids_.size(); ++i) {
+            if (ids_[i] != id) {
+                continue;
+            }
+            const std::size_t old_list = list_of_[i];
+            auto& lst = lists_[old_list];
+            lst.erase(std::remove(lst.begin(), lst.end(), static_cast<int>(i)), lst.end());
+
+            const std::size_t new_list = nearest_centroid(vp);
+            list_of_[i] = new_list;
+            lists_[new_list].push_back(static_cast<int>(i));
+            encode_residual(vp, new_list, codes_.data() + i * params_.M);
+            updated = true;
+        }
+        return updated;
+    }
+
+    bool contains(std::int64_t id) const {
+        return std::find(ids_.begin(), ids_.end(), id) != ids_.end();
+    }
+
+    /// Reconstruct approximate float vector for node `i` (coarse + PQ residual decode).
+    void reconstruct(std::size_t i, float* out) const {
+        if (i >= ids_.size()) {
+            throw std::out_of_range("tinyann::IvfPqIndex::reconstruct");
+        }
+        reconstruct_from_code(list_of_[i], codes_.data() + i * params_.M, out);
+    }
+
+    std::vector<float> reconstruct(std::size_t i) const {
+        std::vector<float> out(dimension_);
+        reconstruct(i, out.data());
+        return out;
+    }
+
+    std::vector<SearchResult> search(const std::vector<float>& query, std::size_t k) const {
+        return search(query, k, [](std::int64_t) { return true; });
+    }
+
+    template <typename Pred>
+    auto search(const std::vector<float>& query, std::size_t k, Pred predicate) const
+        -> std::enable_if_t<std::is_invocable_r<bool, Pred&, std::int64_t>::value,
+                            std::vector<SearchResult>> {
+        if (query.size() != dimension_) {
+            throw std::invalid_argument(
+                "tinyann::IvfPqIndex::search: query dimension mismatch (expected " +
+                std::to_string(dimension_) + ", got " + std::to_string(query.size()) + ")");
+        }
+        require_finite(query, "tinyann::IvfPqIndex::search");
+        if (!trained_ || k == 0 || empty()) {
+            return {};
+        }
+
+        // Cosine: search on unit query (matches train/add normalization).
+        const float* qp = query.data();
+        std::vector<float> q_unit;
+        if (metric_ == Metric::Cosine) {
+            q_unit = query;
+            l2_normalize_inplace(q_unit.data());
+            qp = q_unit.data();
+        }
+
+        const std::size_t nprobe = std::min(params_.nprobe, params_.nlist);
+        auto lists = probe_lists(qp, nprobe);
+
+        std::vector<SearchResult> eligible;
+        eligible.reserve(k * 4);
+
+        // ADC tables: M * kSub floats (rebuilt per probed list because residual depends on
+        // the coarse centroid).
+        std::vector<float> table(params_.M * kSub);
+        std::vector<float> residual(dimension_);
+        std::vector<float> recon(dimension_);
+
+        for (std::size_t li : lists) {
+            if (metric_ == Metric::Cosine) {
+                // Rank by true cosine(q_unit, reconstruct(code)) — same definition as Index.
+                for (int node : lists_[li]) {
+                    const std::int64_t id = ids_[static_cast<std::size_t>(node)];
+                    if (!predicate(id)) {
+                        continue;
+                    }
+                    const std::uint8_t* code =
+                        codes_.data() + static_cast<std::size_t>(node) * params_.M;
+                    reconstruct_from_code(li, code, recon.data());
+                    eligible.push_back(
+                        SearchResult{id, cosine_similarity(qp, recon.data(), dimension_)});
+                }
+            } else {
+                // IP / Euclidean: asymmetric distance computation (no full float corpus).
+                build_adc_table(qp, li, residual.data(), table.data());
+                const float list_base = list_base_score(qp, li);
+                for (int node : lists_[li]) {
+                    const std::int64_t id = ids_[static_cast<std::size_t>(node)];
+                    if (!predicate(id)) {
+                        continue;
+                    }
+                    const std::uint8_t* code =
+                        codes_.data() + static_cast<std::size_t>(node) * params_.M;
+                    eligible.push_back(
+                        SearchResult{id, list_base + adc_from_table(code, table.data())});
+                }
+            }
+        }
+        if (eligible.empty()) {
+            return {};
+        }
+
+        const std::size_t take = std::min(k, eligible.size());
+        const bool hib = higher_is_better(metric_);
+        auto better = [hib](const SearchResult& a, const SearchResult& b) {
+            if (a.score != b.score) {
+                return hib ? (a.score > b.score) : (a.score < b.score);
+            }
+            return a.id < b.id;
+        };
+        if (take < eligible.size()) {
+            std::partial_sort(eligible.begin(),
+                              eligible.begin() + static_cast<std::ptrdiff_t>(take), eligible.end(),
+                              better);
+            eligible.resize(take);
+        } else {
+            std::sort(eligible.begin(), eligible.end(), better);
+        }
+        return eligible;
+    }
+
+    double recall_at_k_vs(const Index& exact, const std::vector<std::vector<float>>& queries,
+                          std::size_t k) const {
+        if (queries.empty()) {
+            return 1.0;
+        }
+        double sum = 0.0;
+        for (const auto& q : queries) {
+            sum += tinyann::recall_at_k(search(q, k), exact.search(q, k));
+        }
+        return sum / static_cast<double>(queries.size());
+    }
+
+    template <typename Pred>
+    auto recall_at_k_vs(const Index& exact, const std::vector<std::vector<float>>& queries,
+                        std::size_t k, Pred predicate) const
+        -> std::enable_if_t<std::is_invocable_r<bool, Pred&, std::int64_t>::value, double> {
+        if (queries.empty()) {
+            return 1.0;
+        }
+        double sum = 0.0;
+        for (const auto& q : queries) {
+            sum += tinyann::recall_at_k(search(q, k, predicate), exact.search(q, k, predicate));
+        }
+        return sum / static_cast<double>(queries.size());
+    }
+
+    void save(const std::string& path) const {
+        if (!trained_) {
+            throw std::runtime_error("tinyann::IvfPqIndex::save: not trained");
+        }
+        std::ofstream out(path, std::ios::binary | std::ios::trunc);
+        if (!out) {
+            throw std::runtime_error("tinyann::IvfPqIndex::save: cannot open " + path);
+        }
+        detail::write_header(out, detail::kKindIvfPq);
+        detail::write_pod(out, static_cast<std::uint32_t>(metric_));
+        detail::write_pod(out, static_cast<std::uint64_t>(dimension_));
+        detail::write_pod(out, static_cast<std::uint64_t>(ids_.size()));
+        detail::write_pod(out, static_cast<std::uint64_t>(params_.nlist));
+        detail::write_pod(out, static_cast<std::uint64_t>(params_.nprobe));
+        detail::write_pod(out, static_cast<std::uint64_t>(params_.kmeans_iters));
+        detail::write_pod(out, static_cast<std::uint64_t>(params_.M));
+        detail::write_pod(out, static_cast<std::uint64_t>(params_.pq_kmeans_iters));
+        detail::write_pod(out, params_.seed);
+
+        if (!ids_.empty()) {
+            detail::write_bytes(out, ids_.data(), ids_.size() * sizeof(std::int64_t));
+        }
+        detail::write_bytes(out, centroids_.data(), centroids_.size() * sizeof(float));
+        detail::write_bytes(out, codebooks_.data(), codebooks_.size() * sizeof(float));
+        for (std::size_t i = 0; i < list_of_.size(); ++i) {
+            detail::write_pod(out, static_cast<std::uint32_t>(list_of_[i]));
+        }
+        for (std::size_t c = 0; c < params_.nlist; ++c) {
+            detail::write_pod(out, static_cast<std::uint32_t>(lists_[c].size()));
+            for (int node : lists_[c]) {
+                detail::write_pod(out, static_cast<std::int32_t>(node));
+            }
+        }
+        if (!codes_.empty()) {
+            detail::write_bytes(out, codes_.data(), codes_.size() * sizeof(std::uint8_t));
+        }
+    }
+
+    static IvfPqIndex load(const std::string& path) {
+        std::ifstream in(path, std::ios::binary);
+        if (!in) {
+            throw std::runtime_error("tinyann::IvfPqIndex::load: cannot open " + path);
+        }
+        detail::read_header(in, detail::kKindIvfPq);
+        const Metric metric = detail::metric_from_u32(detail::read_pod<std::uint32_t>(in));
+        const std::size_t dimension =
+            detail::size_from_u64(detail::read_pod<std::uint64_t>(in), "ivfpq dimension");
+        const std::size_t count =
+            detail::size_from_u64(detail::read_pod<std::uint64_t>(in), "ivfpq count");
+
+        IvfPqParams params;
+        params.nlist = detail::size_from_u64(detail::read_pod<std::uint64_t>(in), "ivfpq nlist");
+        params.nprobe = detail::size_from_u64(detail::read_pod<std::uint64_t>(in), "ivfpq nprobe");
+        params.kmeans_iters =
+            detail::size_from_u64(detail::read_pod<std::uint64_t>(in), "ivfpq kmeans_iters");
+        params.M = detail::size_from_u64(detail::read_pod<std::uint64_t>(in), "ivfpq M");
+        params.pq_kmeans_iters =
+            detail::size_from_u64(detail::read_pod<std::uint64_t>(in), "ivfpq pq_kmeans_iters");
+        params.seed = detail::read_pod<std::uint64_t>(in);
+
+        IvfPqIndex idx(dimension, metric, params);
+        const std::size_t dsub = dimension / params.M;
+
+        idx.ids_.resize(count);
+        if (count > 0) {
+            const std::size_t ids_bytes =
+                detail::checked_mul_size(count, sizeof(std::int64_t), "ivfpq ids bytes");
+            detail::read_bytes(in, idx.ids_.data(), ids_bytes);
+        }
+
+        const std::size_t n_cent =
+            detail::checked_mul_size(params.nlist, dimension, "ivfpq centroids");
+        idx.centroids_.resize(n_cent);
+        detail::read_bytes(in, idx.centroids_.data(),
+                           detail::checked_mul_size(n_cent, sizeof(float), "ivfpq cent bytes"));
+
+        const std::size_t n_cb = detail::checked_mul_size(
+            detail::checked_mul_size(params.M, kSub, "ivfpq M*ksub"), dsub, "ivfpq codebooks");
+        idx.codebooks_.resize(n_cb);
+        detail::read_bytes(in, idx.codebooks_.data(),
+                           detail::checked_mul_size(n_cb, sizeof(float), "ivfpq codebook bytes"));
+
+        idx.list_of_.resize(count);
+        for (std::size_t i = 0; i < count; ++i) {
+            idx.list_of_[i] = detail::read_pod<std::uint32_t>(in);
+        }
+        idx.lists_.assign(params.nlist, {});
+        for (std::size_t c = 0; c < params.nlist; ++c) {
+            const auto sz = static_cast<std::size_t>(detail::read_pod<std::uint32_t>(in));
+            if (sz > count) {
+                throw std::runtime_error(
+                    "tinyann::IvfPqIndex::load: corrupt file (list longer than index)");
+            }
+            idx.lists_[c].resize(sz);
+            for (std::size_t j = 0; j < sz; ++j) {
+                idx.lists_[c][j] = detail::read_pod<std::int32_t>(in);
+            }
+        }
+
+        const std::size_t n_codes = detail::checked_mul_size(count, params.M, "ivfpq codes");
+        idx.codes_.resize(n_codes);
+        if (n_codes > 0) {
+            detail::read_bytes(in, idx.codes_.data(), n_codes);
+        }
+
+        idx.validate_loaded();
+        idx.rebuild_lists_from_list_of();
+        if (idx.params_.nprobe > idx.params_.nlist) {
+            idx.params_.nprobe = idx.params_.nlist;
+        }
+        idx.trained_ = true;
+        return idx;
+    }
+
+    const std::vector<std::int64_t>& ids() const noexcept { return ids_; }
+    const std::vector<std::uint8_t>& codes() const noexcept { return codes_; }
+
+private:
+    void validate_ctor() {
+        if (dimension_ == 0) {
+            throw std::invalid_argument("tinyann::IvfPqIndex: dimension must be > 0");
+        }
+        if (params_.nlist == 0) {
+            throw std::invalid_argument("tinyann::IvfPqIndex: nlist must be > 0");
+        }
+        if (params_.nprobe == 0) {
+            throw std::invalid_argument("tinyann::IvfPqIndex: nprobe must be > 0");
+        }
+        if (params_.kmeans_iters == 0 || params_.pq_kmeans_iters == 0) {
+            throw std::invalid_argument("tinyann::IvfPqIndex: kmeans iters must be > 0");
+        }
+        if (params_.M == 0) {
+            throw std::invalid_argument("tinyann::IvfPqIndex: M must be > 0");
+        }
+        if (dimension_ % params_.M != 0) {
+            throw std::invalid_argument(
+                "tinyann::IvfPqIndex: dimension must be divisible by M (got dim=" +
+                std::to_string(dimension_) + ", M=" + std::to_string(params_.M) + ")");
+        }
+    }
+
+    void clear_data() {
+        ids_.clear();
+        codes_.clear();
+        list_of_.clear();
+        lists_.assign(params_.nlist, {});
+        centroids_.clear();
+        codebooks_.clear();
+        trained_ = false;
+    }
+
+    std::size_t dsub() const noexcept { return dimension_ / params_.M; }
+
+    /// Codebook layout: codebooks_[m * kSub * dsub + k * dsub + d]
+    float* codebook_entry(std::size_t m, std::size_t k) {
+        return codebooks_.data() + (m * kSub + k) * dsub();
+    }
+    const float* codebook_entry(std::size_t m, std::size_t k) const {
+        return codebooks_.data() + (m * kSub + k) * dsub();
+    }
+
+    static bool better_score(Metric m, float a, float b) {
+        return higher_is_better(m) ? (a > b) : (a < b);
+    }
+
+    void normalize_centroid(std::size_t c) {
+        float* p = centroids_.data() + c * dimension_;
+        const float n = l2_norm(p, dimension_);
+        if (n > 0.f) {
+            const float inv = 1.f / n;
+            for (std::size_t d = 0; d < dimension_; ++d) {
+                p[d] *= inv;
+            }
+        }
+    }
+
+    std::size_t nearest_centroid(const float* v) const {
+        std::size_t best = 0;
+        float best_s = metric_score(metric_, v, centroids_.data(), dimension_);
+        for (std::size_t c = 1; c < params_.nlist; ++c) {
+            const float s =
+                metric_score(metric_, v, centroids_.data() + c * dimension_, dimension_);
+            if (better_score(metric_, s, best_s)) {
+                best_s = s;
+                best = c;
+            }
+        }
+        return best;
+    }
+
+    std::vector<std::size_t> probe_lists(const float* q, std::size_t nprobe) const {
+        std::vector<std::pair<float, std::size_t>> scored;
+        scored.reserve(params_.nlist);
+        for (std::size_t c = 0; c < params_.nlist; ++c) {
+            const float s =
+                metric_score(metric_, q, centroids_.data() + c * dimension_, dimension_);
+            scored.emplace_back(s, c);
+        }
+        const bool hib = higher_is_better(metric_);
+        const std::size_t take = std::min(nprobe, scored.size());
+        auto better = [hib](const std::pair<float, std::size_t>& a,
+                            const std::pair<float, std::size_t>& b) {
+            if (a.first != b.first) {
+                return hib ? (a.first > b.first) : (a.first < b.first);
+            }
+            return a.second < b.second;
+        };
+        if (take < scored.size()) {
+            std::partial_sort(scored.begin(), scored.begin() + static_cast<std::ptrdiff_t>(take),
+                              scored.end(), better);
+            scored.resize(take);
+        } else {
+            std::sort(scored.begin(), scored.end(), better);
+        }
+        std::vector<std::size_t> out;
+        out.reserve(scored.size());
+        for (const auto& p : scored) {
+            out.push_back(p.second);
+        }
+        return out;
+    }
+
+    void train_coarse(const std::vector<std::vector<float>>& training) {
+        const std::size_t nt = training.size();
+        const std::size_t nlist = std::min(params_.nlist, nt);
+        if (nlist < params_.nlist) {
+            params_.nlist = nlist;
+        }
+        if (params_.nprobe > params_.nlist) {
+            params_.nprobe = params_.nlist;
+        }
+        lists_.assign(params_.nlist, {});
+        centroids_.assign(params_.nlist * dimension_, 0.f);
+
+        std::mt19937_64 rng(params_.seed);
+        std::vector<std::size_t> order(nt);
+        for (std::size_t i = 0; i < nt; ++i) {
+            order[i] = i;
+        }
+        for (std::size_t i = nt; i > 1; --i) {
+            std::uniform_int_distribution<std::size_t> dist(0, i - 1);
+            std::swap(order[i - 1], order[dist(rng)]);
+        }
+        for (std::size_t c = 0; c < params_.nlist; ++c) {
+            std::copy(training[order[c]].begin(), training[order[c]].end(),
+                      centroids_.begin() + static_cast<std::ptrdiff_t>(c * dimension_));
+            if (metric_ == Metric::Cosine) {
+                normalize_centroid(c);
+            }
+        }
+
+        std::vector<std::size_t> assign(nt, 0);
+        std::vector<std::size_t> counts(params_.nlist, 0);
+        std::vector<float> new_cent(params_.nlist * dimension_, 0.f);
+
+        for (std::size_t iter = 0; iter < params_.kmeans_iters; ++iter) {
+            for (std::size_t i = 0; i < nt; ++i) {
+                assign[i] = nearest_centroid(training[i].data());
+            }
+            std::fill(new_cent.begin(), new_cent.end(), 0.f);
+            std::fill(counts.begin(), counts.end(), 0);
+            for (std::size_t i = 0; i < nt; ++i) {
+                const std::size_t c = assign[i];
+                ++counts[c];
+                float* dst = new_cent.data() + c * dimension_;
+                const float* src = training[i].data();
+                for (std::size_t d = 0; d < dimension_; ++d) {
+                    dst[d] += src[d];
+                }
+            }
+            for (std::size_t c = 0; c < params_.nlist; ++c) {
+                float* dst = centroids_.data() + c * dimension_;
+                if (counts[c] == 0) {
+                    std::uniform_int_distribution<std::size_t> dist(0, nt - 1);
+                    const auto& v = training[dist(rng)];
+                    std::copy(v.begin(), v.end(), dst);
+                } else {
+                    const float inv = 1.f / static_cast<float>(counts[c]);
+                    const float* src = new_cent.data() + c * dimension_;
+                    for (std::size_t d = 0; d < dimension_; ++d) {
+                        dst[d] = src[d] * inv;
+                    }
+                }
+                if (metric_ == Metric::Cosine) {
+                    normalize_centroid(c);
+                }
+            }
+        }
+    }
+
+    void residual_into(const float* v, std::size_t list, float* out) const {
+        const float* c = centroids_.data() + list * dimension_;
+        for (std::size_t d = 0; d < dimension_; ++d) {
+            out[d] = v[d] - c[d];
+        }
+    }
+
+    /// L2-normalize in place. Zero vector left unchanged (cosine with it stays 0).
+    void l2_normalize_inplace(float* v) const {
+        const float n = l2_norm(v, dimension_);
+        if (n > 0.f) {
+            const float inv = 1.f / n;
+            for (std::size_t d = 0; d < dimension_; ++d) {
+                v[d] *= inv;
+            }
+        }
+    }
+
+    /// x̂ = coarse_centroid[list] + Σ_m codebook[m][code[m]]
+    void reconstruct_from_code(std::size_t list, const std::uint8_t* code, float* out) const {
+        const float* c = centroids_.data() + list * dimension_;
+        std::copy(c, c + dimension_, out);
+        const std::size_t ds = dsub();
+        for (std::size_t m = 0; m < params_.M; ++m) {
+            const float* cb = codebook_entry(m, code[m]);
+            float* dst = out + m * ds;
+            for (std::size_t d = 0; d < ds; ++d) {
+                dst[d] += cb[d];
+            }
+        }
+    }
+
+    void train_pq_codebooks(const std::vector<std::vector<float>>& training) {
+        const std::size_t nt = training.size();
+        const std::size_t ds = dsub();
+        codebooks_.assign(params_.M * kSub * ds, 0.f);
+
+        std::vector<float> residual(dimension_);
+        // Per-subspace training matrix: nt * ds (reused)
+        std::vector<float> sub_data(nt * ds);
+        std::mt19937_64 rng(params_.seed + 1337);
+
+        for (std::size_t m = 0; m < params_.M; ++m) {
+            for (std::size_t i = 0; i < nt; ++i) {
+                const std::size_t list = nearest_centroid(training[i].data());
+                residual_into(training[i].data(), list, residual.data());
+                std::copy(residual.begin() + static_cast<std::ptrdiff_t>(m * ds),
+                          residual.begin() + static_cast<std::ptrdiff_t>((m + 1) * ds),
+                          sub_data.begin() + static_cast<std::ptrdiff_t>(i * ds));
+            }
+            train_subspace_kmeans(m, sub_data, nt, ds, rng);
+        }
+    }
+
+    void train_subspace_kmeans(std::size_t m, const std::vector<float>& sub_data, std::size_t nt,
+                               std::size_t ds, std::mt19937_64& rng) {
+        const std::size_t k = std::min(kSub, nt);
+        // Init from random distinct rows
+        std::vector<std::size_t> order(nt);
+        for (std::size_t i = 0; i < nt; ++i) {
+            order[i] = i;
+        }
+        for (std::size_t i = nt; i > 1; --i) {
+            std::uniform_int_distribution<std::size_t> dist(0, i - 1);
+            std::swap(order[i - 1], order[dist(rng)]);
+        }
+        for (std::size_t c = 0; c < k; ++c) {
+            std::copy(sub_data.begin() + static_cast<std::ptrdiff_t>(order[c] * ds),
+                      sub_data.begin() + static_cast<std::ptrdiff_t>((order[c] + 1) * ds),
+                      codebook_entry(m, c));
+        }
+        // Remaining centroids (if k < kSub, rare tiny training) copy from first
+        for (std::size_t c = k; c < kSub; ++c) {
+            std::copy(codebook_entry(m, c % k), codebook_entry(m, c % k) + ds, codebook_entry(m, c));
+        }
+
+        std::vector<std::size_t> assign(nt, 0);
+        std::vector<std::size_t> counts(kSub, 0);
+        std::vector<float> new_cent(kSub * ds, 0.f);
+
+        for (std::size_t iter = 0; iter < params_.pq_kmeans_iters; ++iter) {
+            for (std::size_t i = 0; i < nt; ++i) {
+                const float* x = sub_data.data() + i * ds;
+                std::size_t best = 0;
+                float best_d = simd::squared_l2(x, codebook_entry(m, 0), ds);
+                for (std::size_t c = 1; c < kSub; ++c) {
+                    const float d = simd::squared_l2(x, codebook_entry(m, c), ds);
+                    if (d < best_d) {
+                        best_d = d;
+                        best = c;
+                    }
+                }
+                assign[i] = best;
+            }
+            std::fill(new_cent.begin(), new_cent.end(), 0.f);
+            std::fill(counts.begin(), counts.end(), 0);
+            for (std::size_t i = 0; i < nt; ++i) {
+                const std::size_t c = assign[i];
+                ++counts[c];
+                float* dst = new_cent.data() + c * ds;
+                const float* src = sub_data.data() + i * ds;
+                for (std::size_t d = 0; d < ds; ++d) {
+                    dst[d] += src[d];
+                }
+            }
+            for (std::size_t c = 0; c < kSub; ++c) {
+                float* dst = codebook_entry(m, c);
+                if (counts[c] == 0) {
+                    std::uniform_int_distribution<std::size_t> dist(0, nt - 1);
+                    const std::size_t j = dist(rng);
+                    std::copy(sub_data.begin() + static_cast<std::ptrdiff_t>(j * ds),
+                              sub_data.begin() + static_cast<std::ptrdiff_t>((j + 1) * ds), dst);
+                } else {
+                    const float inv = 1.f / static_cast<float>(counts[c]);
+                    const float* src = new_cent.data() + c * ds;
+                    for (std::size_t d = 0; d < ds; ++d) {
+                        dst[d] = src[d] * inv;
+                    }
+                }
+            }
+        }
+    }
+
+    void encode_residual(const float* v, std::size_t list, std::uint8_t* code_out) const {
+        std::vector<float> residual(dimension_);
+        residual_into(v, list, residual.data());
+        const std::size_t ds = dsub();
+        for (std::size_t m = 0; m < params_.M; ++m) {
+            const float* x = residual.data() + m * ds;
+            std::size_t best = 0;
+            float best_d = simd::squared_l2(x, codebook_entry(m, 0), ds);
+            for (std::size_t c = 1; c < kSub; ++c) {
+                const float d = simd::squared_l2(x, codebook_entry(m, c), ds);
+                if (d < best_d) {
+                    best_d = d;
+                    best = c;
+                }
+            }
+            code_out[m] = static_cast<std::uint8_t>(best);
+        }
+    }
+
+    /// Base term independent of code for a given coarse list (InnerProduct only).
+    /// Euclidean: 0 (distance fully in residual ADC). Cosine uses reconstruct path.
+    float list_base_score(const float* q, std::size_t list) const {
+        if (metric_ != Metric::InnerProduct) {
+            return 0.f;
+        }
+        return inner_product(q, centroids_.data() + list * dimension_, dimension_);
+    }
+
+    void build_adc_table(const float* q, std::size_t list, float* residual_q,
+                         float* table) const {
+        residual_into(q, list, residual_q);
+        const std::size_t ds = dsub();
+        if (metric_ == Metric::Euclidean) {
+            // table[m][k] = || r_q_m - codebook[m][k] ||^2
+            for (std::size_t m = 0; m < params_.M; ++m) {
+                const float* rq = residual_q + m * ds;
+                for (std::size_t c = 0; c < kSub; ++c) {
+                    table[m * kSub + c] = simd::squared_l2(rq, codebook_entry(m, c), ds);
+                }
+            }
+        } else {
+            // InnerProduct (and unused for Cosine search path): IP(q_m, codebook[m][k]).
+            // IP(q, c + r_hat) = IP(q,c) + IP(q, r_hat).
+            for (std::size_t m = 0; m < params_.M; ++m) {
+                const float* qm = q + m * ds;
+                for (std::size_t c = 0; c < kSub; ++c) {
+                    table[m * kSub + c] = inner_product(qm, codebook_entry(m, c), ds);
+                }
+            }
+        }
+    }
+
+    float adc_from_table(const std::uint8_t* code, const float* table) const {
+        float s = 0.f;
+        for (std::size_t m = 0; m < params_.M; ++m) {
+            s += table[m * kSub + code[m]];
+        }
+        return s;
+    }
+
+    void remove_node_at(int idx) {
+        const int n = static_cast<int>(ids_.size());
+        if (idx < 0 || idx >= n) {
+            return;
+        }
+        const int last = n - 1;
+        const std::size_t list = list_of_[static_cast<std::size_t>(idx)];
+        auto& lst = lists_[list];
+        lst.erase(std::remove(lst.begin(), lst.end(), idx), lst.end());
+
+        if (idx != last) {
+            const std::size_t last_list = list_of_[static_cast<std::size_t>(last)];
+            auto& ll = lists_[last_list];
+            ll.erase(std::remove(ll.begin(), ll.end(), last), ll.end());
+
+            ids_[static_cast<std::size_t>(idx)] = ids_[static_cast<std::size_t>(last)];
+            list_of_[static_cast<std::size_t>(idx)] = list_of_[static_cast<std::size_t>(last)];
+            std::copy(codes_.begin() + static_cast<std::ptrdiff_t>(last * static_cast<int>(params_.M)),
+                      codes_.begin() + static_cast<std::ptrdiff_t>((last + 1) * static_cast<int>(params_.M)),
+                      codes_.begin() + static_cast<std::ptrdiff_t>(idx * static_cast<int>(params_.M)));
+            lists_[list_of_[static_cast<std::size_t>(idx)]].push_back(idx);
+        }
+
+        ids_.pop_back();
+        list_of_.pop_back();
+        codes_.resize(ids_.size() * params_.M);
+    }
+
+    void validate_loaded() const {
+        const std::size_t n = ids_.size();
+        if (list_of_.size() != n) {
+            throw std::runtime_error("tinyann::IvfPqIndex::load: list_of size mismatch");
+        }
+        if (codes_.size() != n * params_.M) {
+            throw std::runtime_error("tinyann::IvfPqIndex::load: codes size mismatch");
+        }
+        if (centroids_.size() != params_.nlist * dimension_) {
+            throw std::runtime_error("tinyann::IvfPqIndex::load: centroids size mismatch");
+        }
+        if (codebooks_.size() != params_.M * kSub * dsub()) {
+            throw std::runtime_error("tinyann::IvfPqIndex::load: codebooks size mismatch");
+        }
+        if (lists_.size() != params_.nlist) {
+            throw std::runtime_error("tinyann::IvfPqIndex::load: lists size mismatch");
+        }
+        for (std::size_t i = 0; i < n; ++i) {
+            if (list_of_[i] >= params_.nlist) {
+                throw std::runtime_error("tinyann::IvfPqIndex::load: list_of out of range");
+            }
+        }
+        std::vector<std::uint8_t> seen(n, 0);
+        for (std::size_t c = 0; c < params_.nlist; ++c) {
+            for (int node : lists_[c]) {
+                if (node < 0 || static_cast<std::size_t>(node) >= n) {
+                    throw std::runtime_error("tinyann::IvfPqIndex::load: list node OOB");
+                }
+                const std::size_t u = static_cast<std::size_t>(node);
+                if (list_of_[u] != c) {
+                    throw std::runtime_error("tinyann::IvfPqIndex::load: lists disagree list_of");
+                }
+                if (seen[u] != 0) {
+                    throw std::runtime_error("tinyann::IvfPqIndex::load: duplicate list node");
+                }
+                seen[u] = 1;
+            }
+        }
+        for (std::size_t i = 0; i < n; ++i) {
+            if (seen[i] == 0) {
+                throw std::runtime_error("tinyann::IvfPqIndex::load: node missing from lists");
+            }
+        }
+    }
+
+    void rebuild_lists_from_list_of() {
+        lists_.assign(params_.nlist, {});
+        for (std::size_t i = 0; i < list_of_.size(); ++i) {
+            lists_[list_of_[i]].push_back(static_cast<int>(i));
+        }
+    }
+
+    std::size_t dimension_;
+    Metric metric_;
+    IvfPqParams params_;
+    bool trained_ = false;
+
+    std::vector<float> centroids_;   // nlist * dim
+    std::vector<float> codebooks_;   // M * kSub * dsub
+    std::vector<std::vector<int>> lists_;
+    std::vector<std::int64_t> ids_;
+    std::vector<std::size_t> list_of_;
+    std::vector<std::uint8_t> codes_;  // n * M
 };
 
 }  // namespace tinyann
