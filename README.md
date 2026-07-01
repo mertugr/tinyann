@@ -153,9 +153,17 @@ Header-only: link the `tinyann` CMake interface target (or add `include/`).
 
 Benchmark prints build/search times, QPS, **speedup vs exact**, **recall@k** for HNSW and IVF, and id stability checks.
 
-Vector file: `<id> <f1> … <fN>` per line (`#` comments / blanks ignored).
+Vector file: optional integer `<id>` then `<f1> … <fN>` per line (`#` comments / blanks ignored). The id is parsed as **int64 text** (not float); lines with only `N` floats get auto-assigned sequential ids.
 
-Binary format: magic `TANN`, version, kind (`exact` vs `hnsw`), metric, dimension, ids, vectors; HNSW also stores params, entry point, levels, adjacency lists, and RNG state.
+Binary format: magic `TANN`, version, kind (`exact` / `hnsw` / `ivf` / `sq`), metric, dimension, ids, vectors; HNSW also stores params, entry point, levels, adjacency lists, and RNG state. **Host-endian only** — files are not portable across different-endian machines (no endian marker in the header).
+
+### API notes (from design review)
+
+- **Finite vectors:** `add` / `update` / `search` reject NaN/Inf components.
+- **HNSW concurrency:** do not call `search` concurrently on the **same** `HnswIndex` instance (mutable visit/query caches). Use separate instances or external locking.
+- **HNSW / IVF capacity:** internal node indices are `int`; `add` fails if `size() >= INT_MAX`.
+- **`add` exception safety:** basic guarantee only (a throw while growing storage may leave partial state).
+- **Filtered HNSW:** not a post-filter of unfiltered top‑k; very selective filters may miss some eligibles once the eligible heap is full (raise `ef` or use exact search for perfect filtered recall).
 
 ## Ranking rules
 

@@ -1,4 +1,5 @@
 #include "tinyann/tinyann.hpp"
+#include "tinyann/text_io.hpp"
 
 #include <chrono>
 #include <cstdlib>
@@ -183,30 +184,6 @@ bool parse_args(int argc, char** argv, Options& opt) {
     return true;
 }
 
-bool parse_vector_line(const std::string& line, std::size_t dim, bool allow_id,
-                       std::int64_t& id_out, std::vector<float>& vec_out) {
-    std::istringstream iss(line);
-    std::vector<float> tokens;
-    float x;
-    while (iss >> x) {
-        tokens.push_back(x);
-    }
-    if (tokens.empty()) {
-        return false;
-    }
-    if (tokens.size() == dim) {
-        id_out = -1;
-        vec_out = std::move(tokens);
-        return true;
-    }
-    if (allow_id && tokens.size() == dim + 1) {
-        id_out = static_cast<std::int64_t>(tokens[0]);
-        vec_out.assign(tokens.begin() + 1, tokens.end());
-        return true;
-    }
-    return false;
-}
-
 struct LoadedData {
     std::vector<std::int64_t> ids;
     std::vector<std::vector<float>> vectors;
@@ -225,13 +202,15 @@ bool load_vectors_file(const std::string& path, std::size_t dim, LoadedData& out
         if (line.empty() || line[0] == '#') {
             continue;
         }
+        bool has_id = false;
         std::int64_t id = 0;
         std::vector<float> vec;
-        if (!parse_vector_line(line, dim, /*allow_id=*/true, id, vec)) {
+        if (!tinyann::parse_vector_text_line(line, dim, /*allow_id=*/true, has_id, id, vec)) {
             std::cerr << "bad vector on line " << line_no << " of " << path << "\n";
             return false;
         }
-        if (id < 0) {
+        // Auto-id only when the line has no id column (not when id is negative).
+        if (!has_id) {
             id = static_cast<std::int64_t>(out.ids.size());
         }
         out.ids.push_back(id);
@@ -254,12 +233,16 @@ bool load_queries(const std::string& path, std::size_t dim,
         if (line.empty() || line[0] == '#') {
             continue;
         }
+        bool has_id = false;
         std::int64_t id = 0;
         std::vector<float> vec;
-        if (!parse_vector_line(line, dim, /*allow_id=*/true, id, vec)) {
+        // Optional leading id is accepted and ignored for queries.
+        if (!tinyann::parse_vector_text_line(line, dim, /*allow_id=*/true, has_id, id, vec)) {
             std::cerr << "bad query on line " << line_no << " of " << path << "\n";
             return false;
         }
+        (void)has_id;
+        (void)id;
         queries.push_back(std::move(vec));
     }
     if (queries.empty()) {
@@ -555,12 +538,12 @@ int main(int argc, char** argv) {
         }
 
         if (use_exact(opt.index_type) && opt.use_sq) {
-            tinyann::IndexSq index(1, opt.metric);
+            tinyann::IndexSq index =
+                loading ? tinyann::IndexSq::load(opt.load_path)
+                        : tinyann::IndexSq(opt.dim, opt.metric);
             if (loading) {
-                index = tinyann::IndexSq::load(opt.load_path);
                 std::cerr << "loaded sq index from " << opt.load_path << "\n";
             } else {
-                index = tinyann::IndexSq(opt.dim, opt.metric);
                 LoadedData data;
                 if (!load_vectors_file(opt.vectors_path, opt.dim, data)) {
                     return 1;
@@ -609,27 +592,31 @@ int main(int argc, char** argv) {
         }
 
         if (use_ivf(opt.index_type)) {
-            tinyann::IvfIndex ivf(1, opt.metric);
-            if (loading) {
-                ivf = tinyann::IvfIndex::load(opt.load_path);
-                std::cerr << "loaded ivf index from " << opt.load_path << "\n";
-                if (opt.nprobe != 10) {
-                    ivf.set_nprobe(opt.nprobe);
+            LoadedData ivf_data;
+            if (!loading) {
+                if (!load_vectors_file(opt.vectors_path, opt.dim, ivf_data)) {
+                    return 1;
                 }
-            } else {
+            }
+            tinyann::IvfIndex ivf = [&]() -> tinyann::IvfIndex {
+                if (loading) {
+                    auto loaded = tinyann::IvfIndex::load(opt.load_path);
+                    std::cerr << "loaded ivf index from " << opt.load_path << "\n";
+                    if (opt.nprobe != 10) {
+                        loaded.set_nprobe(opt.nprobe);
+                    }
+                    return loaded;
+                }
                 tinyann::IvfParams ip;
                 ip.nlist = opt.nlist;
                 ip.nprobe = opt.nprobe;
-                ivf = tinyann::IvfIndex(opt.dim, opt.metric, ip);
-                LoadedData data;
-                if (!load_vectors_file(opt.vectors_path, opt.dim, data)) {
-                    return 1;
+                tinyann::IvfIndex built(opt.dim, opt.metric, ip);
+                built.train(ivf_data.vectors);
+                for (std::size_t i = 0; i < ivf_data.ids.size(); ++i) {
+                    built.add(ivf_data.ids[i], ivf_data.vectors[i]);
                 }
-                ivf.train(data.vectors);
-                for (std::size_t i = 0; i < data.ids.size(); ++i) {
-                    ivf.add(data.ids[i], data.vectors[i]);
-                }
-            }
+                return built;
+            }();
             if (!opt.save_path.empty()) {
                 ivf.save(opt.save_path);
                 std::cerr << "saved ivf index to " << opt.save_path << "\n";
@@ -675,12 +662,11 @@ int main(int argc, char** argv) {
         const bool approx = use_hnsw(opt.index_type);
 
         if (!approx) {
-            tinyann::Index index(1, opt.metric);
+            tinyann::Index index =
+                loading ? tinyann::Index::load(opt.load_path) : tinyann::Index(opt.dim, opt.metric);
             if (loading) {
-                index = tinyann::Index::load(opt.load_path);
                 std::cerr << "loaded exact index from " << opt.load_path << "\n";
             } else {
-                index = tinyann::Index(opt.dim, opt.metric);
                 LoadedData data;
                 if (!load_vectors_file(opt.vectors_path, opt.dim, data)) {
                     return 1;
@@ -718,34 +704,41 @@ int main(int argc, char** argv) {
             return 0;
         }
 
-        tinyann::HnswIndex hnsw(1, opt.metric);
-        tinyann::Index exact_for_recall(1, opt.metric);
         bool have_exact = false;
-
-        if (loading) {
-            hnsw = tinyann::HnswIndex::load(opt.load_path);
-            std::cerr << "loaded hnsw index from " << opt.load_path << "\n";
-            if (opt.ef != 64) {
-                hnsw.set_ef_search(opt.ef);
+        LoadedData hnsw_data;
+        if (!loading) {
+            if (!load_vectors_file(opt.vectors_path, opt.dim, hnsw_data)) {
+                return 1;
             }
-        } else {
+        }
+
+        // Construct HNSW at the correct dimension (no dim=1 placeholder).
+        // exact_for_recall only when building from vectors and --recall is set.
+        tinyann::HnswIndex hnsw = [&]() -> tinyann::HnswIndex {
+            if (loading) {
+                auto loaded = tinyann::HnswIndex::load(opt.load_path);
+                std::cerr << "loaded hnsw index from " << opt.load_path << "\n";
+                if (opt.ef != 64) {
+                    loaded.set_ef_search(opt.ef);
+                }
+                return loaded;
+            }
             tinyann::HnswParams hp;
             hp.M = opt.M;
             hp.ef_construction = opt.efc;
             hp.ef_search = opt.ef;
-            hnsw = tinyann::HnswIndex(opt.dim, opt.metric, hp);
-            exact_for_recall = tinyann::Index(opt.dim, opt.metric);
-            have_exact = opt.measure_recall;
-
-            LoadedData data;
-            if (!load_vectors_file(opt.vectors_path, opt.dim, data)) {
-                return 1;
+            tinyann::HnswIndex built(opt.dim, opt.metric, hp);
+            for (std::size_t i = 0; i < hnsw_data.ids.size(); ++i) {
+                built.add(hnsw_data.ids[i], hnsw_data.vectors[i]);
             }
-            for (std::size_t i = 0; i < data.ids.size(); ++i) {
-                hnsw.add(data.ids[i], data.vectors[i]);
-                if (have_exact) {
-                    exact_for_recall.add(data.ids[i], data.vectors[i]);
-                }
+            return built;
+        }();
+
+        tinyann::Index exact_for_recall(hnsw.dimension(), hnsw.metric());
+        if (!loading && opt.measure_recall) {
+            have_exact = true;
+            for (std::size_t i = 0; i < hnsw_data.ids.size(); ++i) {
+                exact_for_recall.add(hnsw_data.ids[i], hnsw_data.vectors[i]);
             }
         }
 
