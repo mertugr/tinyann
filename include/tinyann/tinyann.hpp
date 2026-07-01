@@ -2480,6 +2480,12 @@ struct IvfPqParams {
     std::size_t pq_kmeans_iters = 25;
     /// RNG seed for coarse + PQ training.
     std::uint64_t seed = 42;
+    /// If true, learn an orthogonal rotation before residual PQ (OPQ).
+    /// Improves subspace independence / recall at the same code size; adds a
+    /// `dim×dim` matrix and longer train. Default off for a simpler baseline.
+    bool use_opq = false;
+    /// Alternating OPQ iterations (rotation ↔ PQ codebooks). Ignored if `!use_opq`.
+    std::size_t opq_iters = 10;
 };
 
 /// In-memory IVF index with product-quantized residuals (compressed corpus).
@@ -2488,12 +2494,15 @@ struct IvfPqParams {
 /// Suitable for large corpora where full-float IVF or HNSW RAM is prohibitive.
 /// Concurrent search is safe while the index is immutable (no concurrent train/add).
 ///
+/// **Optional OPQ:** with `use_opq=true`, a learned orthogonal matrix `R` is applied
+/// to residuals before PQ (`y = R r`). Encode/search/reconstruct use `R` / `Rᵀ`
+/// consistently (FAISS-style optimized product quantization on residuals).
+///
 /// **Metrics (consistent with `Index` / `IvfIndex` / `HnswIndex`):**
 /// - **Euclidean:** residual L2 ADC (approx squared residual distance; lower better).
 /// - **InnerProduct:** asymmetric IP ADC on residual reconstruction (higher better).
 /// - **Cosine:** inputs are **L2-normalized** on train/add/update/search (scale-invariant
-///   like true cosine); ranking uses the IP ADC path on the unit sphere, then final
-///   hit scores are true `cosine_similarity(query, reconstruct(code))`.
+///   like true cosine); scores are true `cosine_similarity(query, reconstruct(code))`.
 class IvfPqIndex {
 public:
     /// Fixed 8-bit codes per subspace (FAISS default ksub = 256).
@@ -2512,6 +2521,8 @@ public:
     bool trained() const noexcept { return trained_; }
     const IvfPqParams& params() const noexcept { return params_; }
     std::size_t code_size() const noexcept { return params_.M; }  // bytes per vector
+    /// True if an OPQ rotation was trained (matrix size dim×dim).
+    bool uses_opq() const noexcept { return params_.use_opq && opq_R_.size() == dimension_ * dimension_; }
 
     void set_nprobe(std::size_t nprobe) {
         if (nprobe == 0) {
@@ -2780,6 +2791,8 @@ public:
         detail::write_pod(out, static_cast<std::uint64_t>(params_.M));
         detail::write_pod(out, static_cast<std::uint64_t>(params_.pq_kmeans_iters));
         detail::write_pod(out, params_.seed);
+        detail::write_pod(out, static_cast<std::uint8_t>(params_.use_opq ? 1 : 0));
+        detail::write_pod(out, static_cast<std::uint64_t>(params_.opq_iters));
 
         if (!ids_.empty()) {
             detail::write_bytes(out, ids_.data(), ids_.size() * sizeof(std::int64_t));
@@ -2797,6 +2810,12 @@ public:
         }
         if (!codes_.empty()) {
             detail::write_bytes(out, codes_.data(), codes_.size() * sizeof(std::uint8_t));
+        }
+        if (params_.use_opq) {
+            if (opq_R_.size() != dimension_ * dimension_) {
+                throw std::runtime_error("tinyann::IvfPqIndex::save: missing OPQ matrix");
+            }
+            detail::write_bytes(out, opq_R_.data(), opq_R_.size() * sizeof(float));
         }
     }
 
@@ -2821,6 +2840,9 @@ public:
         params.pq_kmeans_iters =
             detail::size_from_u64(detail::read_pod<std::uint64_t>(in), "ivfpq pq_kmeans_iters");
         params.seed = detail::read_pod<std::uint64_t>(in);
+        params.use_opq = (detail::read_pod<std::uint8_t>(in) != 0);
+        params.opq_iters =
+            detail::size_from_u64(detail::read_pod<std::uint64_t>(in), "ivfpq opq_iters");
 
         IvfPqIndex idx(dimension, metric, params);
         const std::size_t dsub = dimension / params.M;
@@ -2867,6 +2889,14 @@ public:
             detail::read_bytes(in, idx.codes_.data(), n_codes);
         }
 
+        if (params.use_opq) {
+            const std::size_t nR =
+                detail::checked_mul_size(dimension, dimension, "ivfpq OPQ R");
+            idx.opq_R_.resize(nR);
+            detail::read_bytes(in, idx.opq_R_.data(),
+                               detail::checked_mul_size(nR, sizeof(float), "ivfpq OPQ bytes"));
+        }
+
         idx.validate_loaded();
         idx.rebuild_lists_from_list_of();
         if (idx.params_.nprobe > idx.params_.nlist) {
@@ -2878,6 +2908,7 @@ public:
 
     const std::vector<std::int64_t>& ids() const noexcept { return ids_; }
     const std::vector<std::uint8_t>& codes() const noexcept { return codes_; }
+    const std::vector<float>& opq_matrix() const noexcept { return opq_R_; }
 
 private:
     void validate_ctor() {
@@ -2910,7 +2941,56 @@ private:
         lists_.assign(params_.nlist, {});
         centroids_.clear();
         codebooks_.clear();
+        opq_R_.clear();
         trained_ = false;
+    }
+
+    void set_identity_opq() {
+        opq_R_.assign(dimension_ * dimension_, 0.f);
+        for (std::size_t i = 0; i < dimension_; ++i) {
+            opq_R_[i * dimension_ + i] = 1.f;
+        }
+    }
+
+    /// y = R * x (R row-major).
+    void apply_opq(const float* x, float* y) const {
+        const std::size_t d = dimension_;
+        for (std::size_t i = 0; i < d; ++i) {
+            float s = 0.f;
+            const float* row = opq_R_.data() + i * d;
+            for (std::size_t j = 0; j < d; ++j) {
+                s += row[j] * x[j];
+            }
+            y[i] = s;
+        }
+    }
+
+    /// x = Rᵀ * y
+    void apply_opq_transpose(const float* y, float* x) const {
+        const std::size_t d = dimension_;
+        std::fill(x, x + d, 0.f);
+        for (std::size_t i = 0; i < d; ++i) {
+            const float yi = y[i];
+            const float* row = opq_R_.data() + i * d;
+            for (std::size_t j = 0; j < d; ++j) {
+                x[j] += row[j] * yi;
+            }
+        }
+    }
+
+    /// Decode PQ code to residual in the (possibly rotated) PQ space, then map to original.
+    void decode_residual(const std::uint8_t* code, float* residual_out) const {
+        const std::size_t ds = dsub();
+        std::vector<float> rot(dimension_, 0.f);
+        for (std::size_t m = 0; m < params_.M; ++m) {
+            const float* cb = codebook_entry(m, code[m]);
+            std::copy(cb, cb + ds, rot.begin() + static_cast<std::ptrdiff_t>(m * ds));
+        }
+        if (params_.use_opq && opq_R_.size() == dimension_ * dimension_) {
+            apply_opq_transpose(rot.data(), residual_out);
+        } else {
+            std::copy(rot.begin(), rot.end(), residual_out);
+        }
     }
 
     std::size_t dsub() const noexcept { return dimension_ / params_.M; }
@@ -3070,40 +3150,235 @@ private:
         }
     }
 
-    /// x̂ = coarse_centroid[list] + Σ_m codebook[m][code[m]]
+    /// x̂ = coarse_centroid[list] + residual_hat; residual_hat = Rᵀ decode(code) if OPQ else decode.
     void reconstruct_from_code(std::size_t list, const std::uint8_t* code, float* out) const {
         const float* c = centroids_.data() + list * dimension_;
-        std::copy(c, c + dimension_, out);
+        std::vector<float> residual(dimension_);
+        decode_residual(code, residual.data());
+        for (std::size_t d = 0; d < dimension_; ++d) {
+            out[d] = c[d] + residual[d];
+        }
+    }
+
+    /// Collect residuals for all training vectors (row-major nt * dim).
+    void collect_residuals(const std::vector<std::vector<float>>& training,
+                           std::vector<float>& residuals_out) const {
+        const std::size_t nt = training.size();
+        residuals_out.resize(nt * dimension_);
+        for (std::size_t i = 0; i < nt; ++i) {
+            residual_into(training[i].data(), nearest_centroid(training[i].data()),
+                          residuals_out.data() + i * dimension_);
+        }
+    }
+
+    /// Train all M subspace codebooks on a matrix of vectors (row-major nt * dim).
+    void train_pq_on_matrix(const std::vector<float>& data, std::size_t nt, std::mt19937_64& rng) {
+        const std::size_t ds = dsub();
+        codebooks_.assign(params_.M * kSub * ds, 0.f);
+        std::vector<float> sub_data(nt * ds);
+        for (std::size_t m = 0; m < params_.M; ++m) {
+            for (std::size_t i = 0; i < nt; ++i) {
+                std::copy(data.begin() + static_cast<std::ptrdiff_t>(i * dimension_ + m * ds),
+                          data.begin() + static_cast<std::ptrdiff_t>(i * dimension_ + (m + 1) * ds),
+                          sub_data.begin() + static_cast<std::ptrdiff_t>(i * ds));
+            }
+            train_subspace_kmeans(m, sub_data, nt, ds, rng);
+        }
+    }
+
+    /// Encode one vector already in PQ space (after optional OPQ rotation).
+    void encode_pq_space(const float* y, std::uint8_t* code_out) const {
+        const std::size_t ds = dsub();
+        for (std::size_t m = 0; m < params_.M; ++m) {
+            const float* x = y + m * ds;
+            std::size_t best = 0;
+            float best_d = simd::squared_l2(x, codebook_entry(m, 0), ds);
+            for (std::size_t c = 1; c < kSub; ++c) {
+                const float d = simd::squared_l2(x, codebook_entry(m, c), ds);
+                if (d < best_d) {
+                    best_d = d;
+                    best = c;
+                }
+            }
+            code_out[m] = static_cast<std::uint8_t>(best);
+        }
+    }
+
+    /// PQ reconstruct in PQ/rotated space only (concat of codebook entries).
+    void decode_pq_space(const std::uint8_t* code, float* y_out) const {
         const std::size_t ds = dsub();
         for (std::size_t m = 0; m < params_.M; ++m) {
             const float* cb = codebook_entry(m, code[m]);
-            float* dst = out + m * ds;
-            for (std::size_t d = 0; d < ds; ++d) {
-                dst[d] += cb[d];
+            std::copy(cb, cb + ds, y_out + m * ds);
+        }
+    }
+
+    /// Orthogonal Procrustes: R = U Vᵀ from SVD of M (d×d), via Jacobi on M Mᵀ.
+    void procrustes_update_R(const std::vector<float>& X, const std::vector<float>& Y,
+                             std::size_t nt) {
+        // M = Y * Xᵀ  (d x d), X/Y row-major nt * d
+        const std::size_t d = dimension_;
+        std::vector<float> M(d * d, 0.f);
+        for (std::size_t i = 0; i < nt; ++i) {
+            const float* xi = X.data() + i * d;
+            const float* yi = Y.data() + i * d;
+            for (std::size_t a = 0; a < d; ++a) {
+                for (std::size_t b = 0; b < d; ++b) {
+                    M[a * d + b] += yi[a] * xi[b];
+                }
             }
+        }
+        // SVD M = U S Vᵀ using Jacobi on A = M Mᵀ (left singular vectors U),
+        // then V columns from Mᵀ u / σ.
+        std::vector<float> A(d * d, 0.f);
+        for (std::size_t i = 0; i < d; ++i) {
+            for (std::size_t j = 0; j < d; ++j) {
+                float s = 0.f;
+                for (std::size_t k = 0; k < d; ++k) {
+                    s += M[i * d + k] * M[j * d + k];
+                }
+                A[i * d + j] = s;
+            }
+        }
+        std::vector<float> U(d * d, 0.f);
+        std::vector<float> evals(d, 0.f);
+        jacobi_eigen_symmetric(A, U, evals, d);
+
+        std::vector<float> V(d * d, 0.f);
+        for (std::size_t j = 0; j < d; ++j) {
+            // v_j proportional to Mᵀ u_j
+            std::vector<float> v(d, 0.f);
+            for (std::size_t i = 0; i < d; ++i) {
+                float s = 0.f;
+                for (std::size_t k = 0; k < d; ++k) {
+                    s += M[k * d + i] * U[k * d + j];
+                }
+                v[i] = s;
+            }
+            float n2 = 0.f;
+            for (std::size_t i = 0; i < d; ++i) {
+                n2 += v[i] * v[i];
+            }
+            const float inv = (n2 > 1e-20f) ? (1.f / std::sqrt(n2)) : 0.f;
+            for (std::size_t i = 0; i < d; ++i) {
+                V[i * d + j] = v[i] * inv;  // store V as columns in row-major: V[i][j]
+            }
+        }
+        // R = U Vᵀ  => R[i][j] = sum_k U[i][k] V[j][k]
+        opq_R_.assign(d * d, 0.f);
+        for (std::size_t i = 0; i < d; ++i) {
+            for (std::size_t j = 0; j < d; ++j) {
+                float s = 0.f;
+                for (std::size_t k = 0; k < d; ++k) {
+                    s += U[i * d + k] * V[j * d + k];
+                }
+                opq_R_[i * d + j] = s;
+            }
+        }
+    }
+
+    /// Jacobi eigenvalue decomposition for symmetric A (destroyed). U columns eigenvectors.
+    static void jacobi_eigen_symmetric(std::vector<float>& A, std::vector<float>& U,
+                                       std::vector<float>& evals, std::size_t n) {
+        U.assign(n * n, 0.f);
+        for (std::size_t i = 0; i < n; ++i) {
+            U[i * n + i] = 1.f;
+        }
+        const int max_sweeps = 40;
+        for (int sweep = 0; sweep < max_sweeps; ++sweep) {
+            float off = 0.f;
+            for (std::size_t p = 0; p < n; ++p) {
+                for (std::size_t q = p + 1; q < n; ++q) {
+                    off += std::fabs(A[p * n + q]);
+                }
+            }
+            if (off < 1e-8f * static_cast<float>(n)) {
+                break;
+            }
+            for (std::size_t p = 0; p < n; ++p) {
+                for (std::size_t q = p + 1; q < n; ++q) {
+                    const float app = A[p * n + p];
+                    const float aqq = A[q * n + q];
+                    const float apq = A[p * n + q];
+                    if (std::fabs(apq) < 1e-12f) {
+                        continue;
+                    }
+                    const float tau = (aqq - app) / (2.f * apq);
+                    const float t =
+                        (tau >= 0.f)
+                            ? (1.f / (tau + std::sqrt(1.f + tau * tau)))
+                            : (-1.f / (-tau + std::sqrt(1.f + tau * tau)));
+                    const float c = 1.f / std::sqrt(1.f + t * t);
+                    const float s = t * c;
+                    // Rotate A
+                    for (std::size_t r = 0; r < n; ++r) {
+                        if (r == p || r == q) {
+                            continue;
+                        }
+                        const float arp = A[r * n + p];
+                        const float arq = A[r * n + q];
+                        A[r * n + p] = A[p * n + r] = c * arp - s * arq;
+                        A[r * n + q] = A[q * n + r] = s * arp + c * arq;
+                    }
+                    A[p * n + p] = app - t * apq;
+                    A[q * n + q] = aqq + t * apq;
+                    A[p * n + q] = A[q * n + p] = 0.f;
+                    // Accumulate U
+                    for (std::size_t r = 0; r < n; ++r) {
+                        const float urp = U[r * n + p];
+                        const float urq = U[r * n + q];
+                        U[r * n + p] = c * urp - s * urq;
+                        U[r * n + q] = s * urp + c * urq;
+                    }
+                }
+            }
+        }
+        for (std::size_t i = 0; i < n; ++i) {
+            evals[i] = A[i * n + i];
         }
     }
 
     void train_pq_codebooks(const std::vector<std::vector<float>>& training) {
         const std::size_t nt = training.size();
-        const std::size_t ds = dsub();
-        codebooks_.assign(params_.M * kSub * ds, 0.f);
-
-        std::vector<float> residual(dimension_);
-        // Per-subspace training matrix: nt * ds (reused)
-        std::vector<float> sub_data(nt * ds);
         std::mt19937_64 rng(params_.seed + 1337);
 
-        for (std::size_t m = 0; m < params_.M; ++m) {
-            for (std::size_t i = 0; i < nt; ++i) {
-                const std::size_t list = nearest_centroid(training[i].data());
-                residual_into(training[i].data(), list, residual.data());
-                std::copy(residual.begin() + static_cast<std::ptrdiff_t>(m * ds),
-                          residual.begin() + static_cast<std::ptrdiff_t>((m + 1) * ds),
-                          sub_data.begin() + static_cast<std::ptrdiff_t>(i * ds));
-            }
-            train_subspace_kmeans(m, sub_data, nt, ds, rng);
+        std::vector<float> residuals;
+        collect_residuals(training, residuals);
+
+        if (!params_.use_opq) {
+            set_identity_opq();
+            // Train PQ directly on residuals (identity rotation).
+            train_pq_on_matrix(residuals, nt, rng);
+            // Clear R storage when not using OPQ to save RAM / mark uses_opq false.
+            opq_R_.clear();
+            return;
         }
+
+        set_identity_opq();
+        std::vector<float> rotated(nt * dimension_);
+        std::vector<float> y_recon(nt * dimension_);
+        std::vector<std::uint8_t> code(params_.M);
+
+        const std::size_t iters = std::max<std::size_t>(params_.opq_iters, 1);
+        for (std::size_t it = 0; it < iters; ++it) {
+            // Y = R * X
+            for (std::size_t i = 0; i < nt; ++i) {
+                apply_opq(residuals.data() + i * dimension_, rotated.data() + i * dimension_);
+            }
+            train_pq_on_matrix(rotated, nt, rng);
+            // Reconstruct in rotated space
+            for (std::size_t i = 0; i < nt; ++i) {
+                encode_pq_space(rotated.data() + i * dimension_, code.data());
+                decode_pq_space(code.data(), y_recon.data() + i * dimension_);
+            }
+            // Update R from Procrustes (align R X to Y_recon)
+            procrustes_update_R(residuals, y_recon, nt);
+        }
+        // Final codebooks on last R
+        for (std::size_t i = 0; i < nt; ++i) {
+            apply_opq(residuals.data() + i * dimension_, rotated.data() + i * dimension_);
+        }
+        train_pq_on_matrix(rotated, nt, rng);
     }
 
     void train_subspace_kmeans(std::size_t m, const std::vector<float>& sub_data, std::size_t nt,
@@ -3178,19 +3453,12 @@ private:
     void encode_residual(const float* v, std::size_t list, std::uint8_t* code_out) const {
         std::vector<float> residual(dimension_);
         residual_into(v, list, residual.data());
-        const std::size_t ds = dsub();
-        for (std::size_t m = 0; m < params_.M; ++m) {
-            const float* x = residual.data() + m * ds;
-            std::size_t best = 0;
-            float best_d = simd::squared_l2(x, codebook_entry(m, 0), ds);
-            for (std::size_t c = 1; c < kSub; ++c) {
-                const float d = simd::squared_l2(x, codebook_entry(m, c), ds);
-                if (d < best_d) {
-                    best_d = d;
-                    best = c;
-                }
-            }
-            code_out[m] = static_cast<std::uint8_t>(best);
+        if (params_.use_opq && opq_R_.size() == dimension_ * dimension_) {
+            std::vector<float> rotated(dimension_);
+            apply_opq(residual.data(), rotated.data());
+            encode_pq_space(rotated.data(), code_out);
+        } else {
+            encode_pq_space(residual.data(), code_out);
         }
     }
 
@@ -3206,20 +3474,34 @@ private:
     void build_adc_table(const float* q, std::size_t list, float* residual_q,
                          float* table) const {
         residual_into(q, list, residual_q);
+        // Work in PQ space: optionally y = R * residual (||R r - d|| = ||r - Rᵀ d||).
+        std::vector<float> pq_query(dimension_);
+        const float* yq = residual_q;
+        if (params_.use_opq && opq_R_.size() == dimension_ * dimension_) {
+            if (metric_ == Metric::Euclidean) {
+                apply_opq(residual_q, pq_query.data());
+                yq = pq_query.data();
+            } else {
+                // IP(q, c + Rᵀ d) = IP(q,c) + IP(R q, d) — use full rotated query.
+                apply_opq(q, pq_query.data());
+                yq = pq_query.data();
+            }
+        } else if (metric_ == Metric::InnerProduct) {
+            yq = q;  // IP tables on full query subspaces
+        }
+
         const std::size_t ds = dsub();
         if (metric_ == Metric::Euclidean) {
-            // table[m][k] = || r_q_m - codebook[m][k] ||^2
             for (std::size_t m = 0; m < params_.M; ++m) {
-                const float* rq = residual_q + m * ds;
+                const float* rq = yq + m * ds;
                 for (std::size_t c = 0; c < kSub; ++c) {
                     table[m * kSub + c] = simd::squared_l2(rq, codebook_entry(m, c), ds);
                 }
             }
         } else {
-            // InnerProduct (and unused for Cosine search path): IP(q_m, codebook[m][k]).
-            // IP(q, c + r_hat) = IP(q,c) + IP(q, r_hat).
+            // InnerProduct: table[m][k] = IP(yq_m, codebook[m][k])
             for (std::size_t m = 0; m < params_.M; ++m) {
-                const float* qm = q + m * ds;
+                const float* qm = yq + m * ds;
                 for (std::size_t c = 0; c < kSub; ++c) {
                     table[m * kSub + c] = inner_product(qm, codebook_entry(m, c), ds);
                 }
@@ -3280,6 +3562,13 @@ private:
         if (lists_.size() != params_.nlist) {
             throw std::runtime_error("tinyann::IvfPqIndex::load: lists size mismatch");
         }
+        if (params_.use_opq) {
+            if (opq_R_.size() != dimension_ * dimension_) {
+                throw std::runtime_error("tinyann::IvfPqIndex::load: OPQ matrix size mismatch");
+            }
+        } else if (!opq_R_.empty()) {
+            throw std::runtime_error("tinyann::IvfPqIndex::load: unexpected OPQ matrix");
+        }
         for (std::size_t i = 0; i < n; ++i) {
             if (list_of_[i] >= params_.nlist) {
                 throw std::runtime_error("tinyann::IvfPqIndex::load: list_of out of range");
@@ -3326,6 +3615,7 @@ private:
     std::vector<std::int64_t> ids_;
     std::vector<std::size_t> list_of_;
     std::vector<std::uint8_t> codes_;  // n * M
+    std::vector<float> opq_R_;         // optional dim*dim row-major orthogonal matrix
 };
 
 }  // namespace tinyann

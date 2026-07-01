@@ -44,6 +44,8 @@ void print_usage(const char* argv0) {
         << "  --pq-m N          IVFPQ number of subquantizers M; dim must be divisible by M\n"
         << "                    (default: 8)\n"
         << "  --pq-iters N      IVFPQ per-subspace k-means iterations (default: 25)\n"
+        << "  --opq             IVFPQ: enable Optimized Product Quantization (learned rotation)\n"
+        << "  --opq-iters N     IVFPQ: OPQ alternating iterations (default: 10)\n"
         << "  --save PATH       Write built/loaded index to PATH (binary)\n"
         << "  --load PATH       Load index from PATH instead of --vectors\n"
         << "  --allow-ids FILE  Filtered search: only ids listed in FILE (one int64 per line)\n"
@@ -72,6 +74,8 @@ struct Options {
     std::size_t nprobe = 10;
     std::size_t pq_m = 8;
     std::size_t pq_iters = 25;
+    bool use_opq = false;
+    std::size_t opq_iters = 10;
     std::string save_path;
     std::string load_path;
     std::string allow_ids_path;
@@ -152,6 +156,12 @@ bool parse_args(int argc, char** argv, Options& opt) {
             const char* v = need("--pq-iters");
             if (!v) return false;
             opt.pq_iters = static_cast<std::size_t>(std::stoull(v));
+        } else if (arg == "--opq") {
+            opt.use_opq = true;
+        } else if (arg == "--opq-iters") {
+            const char* v = need("--opq-iters");
+            if (!v) return false;
+            opt.opq_iters = static_cast<std::size_t>(std::stoull(v));
         } else if (arg == "--save") {
             const char* v = need("--save");
             if (!v) return false;
@@ -632,6 +642,8 @@ int main(int argc, char** argv) {
                 ip.M = opt.pq_m;
                 ip.pq_kmeans_iters = opt.pq_iters;
                 ip.seed = opt.seed;
+                ip.use_opq = opt.use_opq;
+                ip.opq_iters = opt.opq_iters;
                 tinyann::IvfPqIndex built(opt.dim, opt.metric, ip);
                 built.train(ivfpq_data.vectors);
                 for (std::size_t i = 0; i < ivfpq_data.ids.size(); ++i) {
@@ -647,6 +659,7 @@ int main(int argc, char** argv) {
                       << " metric=" << tinyann::metric_name(ivfpq.metric()) << " k=" << opt.k
                       << " nlist=" << ivfpq.params().nlist << " nprobe=" << ivfpq.params().nprobe
                       << " M=" << ivfpq.params().M << " code_bytes=" << ivfpq.code_size()
+                      << " opq=" << (ivfpq.uses_opq() ? 1 : 0)
                       << (filtered ? " filtered=1" : "") << "\n";
             if (!opt.query_path.empty()) {
                 std::vector<std::vector<float>> queries;
