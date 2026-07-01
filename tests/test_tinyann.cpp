@@ -1,6 +1,7 @@
 #include "tinyann/tinyann.hpp"
 #include "tinyann/text_io.hpp"
 
+#include <atomic>
 #include <cmath>
 #include <cstdint>
 #include <cstdlib>
@@ -11,6 +12,7 @@
 #include <limits>
 #include <random>
 #include <string>
+#include <thread>
 #include <vector>
 
 namespace {
@@ -1233,6 +1235,97 @@ void write_hostile_sq_header(const std::string& path, std::uint64_t dim, std::ui
     out.write(reinterpret_cast<const char*>(&count), 8);
 }
 
+void test_hnsw_concurrent_search() {
+    // Concurrent search on one HnswIndex must match sequential results (no races on
+    // visit stamps / query norm). Writers are not concurrent here — build then search-only.
+    const std::size_t dim = 32;
+    const std::size_t n = 3000;
+    const std::size_t nq = 80;
+    const std::size_t k = 10;
+    const std::size_t nthreads = 8;
+    const std::size_t rounds = 4;
+
+    tinyann::HnswParams p;
+    p.M = 16;
+    p.ef_construction = 100;
+    p.ef_search = 64;
+    p.seed = 2026;
+
+    tinyann::HnswIndex hnsw(dim, tinyann::Metric::Cosine, p);
+    std::mt19937_64 rng(4242);
+    for (std::size_t i = 0; i < n; ++i) {
+        hnsw.add(static_cast<std::int64_t>(i), random_unit_vector(dim, rng));
+    }
+
+    std::vector<std::vector<float>> queries;
+    queries.reserve(nq);
+    for (std::size_t i = 0; i < nq; ++i) {
+        queries.push_back(random_unit_vector(dim, rng));
+    }
+
+    // Sequential gold standard (same queries, same k/ef).
+    std::vector<std::vector<tinyann::SearchResult>> gold(nq);
+    for (std::size_t i = 0; i < nq; ++i) {
+        gold[i] = hnsw.search(queries[i], k, /*ef=*/64);
+        CHECK(!gold[i].empty());
+    }
+
+    auto even = [](std::int64_t id) { return (id % 2) == 0; };
+    std::vector<std::vector<tinyann::SearchResult>> filtered_gold(nq);
+    for (std::size_t i = 0; i < nq; ++i) {
+        filtered_gold[i] = hnsw.search(queries[i], k, /*ef=*/64, even);
+        for (const auto& hit : filtered_gold[i]) {
+            CHECK((hit.id % 2) == 0);
+        }
+    }
+
+    std::atomic<int> mismatches{0};
+    std::atomic<int> filtered_mismatches{0};
+
+    auto worker = [&](std::size_t tid) {
+        for (std::size_t r = 0; r < rounds; ++r) {
+            for (std::size_t i = 0; i < nq; ++i) {
+                // Stagger query order slightly per thread to stress interleaving.
+                const std::size_t qi = (i * 17 + tid * 3 + r) % nq;
+                const auto hits = hnsw.search(queries[qi], k, /*ef=*/64);
+                if (!results_byte_identical(hits, gold[qi])) {
+                    mismatches.fetch_add(1, std::memory_order_relaxed);
+                }
+                const auto fh = hnsw.search(queries[qi], k, /*ef=*/64, even);
+                if (!results_byte_identical(fh, filtered_gold[qi])) {
+                    filtered_mismatches.fetch_add(1, std::memory_order_relaxed);
+                }
+                for (const auto& hit : fh) {
+                    if ((hit.id % 2) != 0) {
+                        filtered_mismatches.fetch_add(1, std::memory_order_relaxed);
+                    }
+                }
+            }
+        }
+    };
+
+    std::vector<std::thread> threads;
+    threads.reserve(nthreads);
+    for (std::size_t t = 0; t < nthreads; ++t) {
+        threads.emplace_back(worker, t);
+    }
+    for (auto& th : threads) {
+        th.join();
+    }
+
+    CHECK(mismatches.load() == 0);
+    CHECK(filtered_mismatches.load() == 0);
+
+    // After concurrent searches, single-thread results still match gold (no corruption).
+    for (std::size_t i = 0; i < nq; ++i) {
+        CHECK(results_byte_identical(hnsw.search(queries[i], k, /*ef=*/64), gold[i]));
+        CHECK(results_byte_identical(hnsw.search(queries[i], k, /*ef=*/64, even), filtered_gold[i]));
+    }
+
+    std::cout << "hnsw_concurrent_search threads=" << nthreads << " nq=" << nq
+              << " rounds=" << rounds << " OK\n";
+}
+
 void test_reject_non_finite() {
     tinyann::Index idx(2, tinyann::Metric::InnerProduct);
     bool threw = false;
@@ -1701,6 +1794,7 @@ int main() {
     test_hnsw_filtered_search_basic();
     test_hnsw_filtered_not_postfilter_topk();
     test_hnsw_filtered_recall();
+    test_hnsw_concurrent_search();
     test_ivf_basic_and_filter();
     test_ivf_recall();
     test_ivf_save_load();

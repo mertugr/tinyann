@@ -809,9 +809,10 @@ struct HnswParams {
 
 /// In-memory approximate k-NN index based on HNSW.
 ///
-/// **Concurrency:** `search` is not safe to call concurrently on the *same*
-/// instance (mutable per-search visit stamps / query-norm cache). Concurrent
-/// searches require separate `HnswIndex` instances (or external locking).
+/// **Concurrency:** concurrent `search` (including filtered overloads) on the
+/// *same* instance is safe — visit stamps and query-norm live in per-call
+/// scratch, not shared mutable fields. Concurrent `add` / `remove` / `update`
+/// with each other or with `search` is **not** supported (no writer locks).
 ///
 /// **Capacity:** node indices are `int`; `add` rejects when `size() >= INT_MAX`.
 ///
@@ -963,7 +964,8 @@ public:
         return std::find(ids_.begin(), ids_.end(), id) != ids_.end();
     }
 
-    /// Approximate k-NN. Not concurrent-safe on the same instance (see class note).
+    /// Approximate k-NN. Concurrent-safe with other `search` calls on this instance
+    /// (see class note); not concurrent with mutating methods.
     std::vector<SearchResult> search(const std::vector<float>& query, std::size_t k) const {
         return search(query, k, params_.ef_search, [](std::int64_t) { return true; });
     }
@@ -1010,19 +1012,20 @@ public:
         }
         ef = std::max(ef, k);
 
-        // Cache query L2 norm once for cosine navigation (avoids per-node sqrt pairs).
+        // Per-call scratch: concurrent search on one instance must not share visit/query state.
+        SearchScratch scratch;
         if (metric_ == Metric::Cosine) {
-            query_norm_ = l2_norm(query.data(), dimension_);
+            scratch.query_norm = l2_norm(query.data(), dimension_);
         }
 
         int curr = entry_point_;
         for (int lc = max_level_; lc > 0; --lc) {
             // Upper layers: navigate on the full graph (no filter) for connectivity.
-            curr = greedy_update_query(query.data(), curr, lc);
+            curr = greedy_update_query(query.data(), curr, lc, scratch);
         }
 
-        auto candidates =
-            search_layer_query_filtered(query.data(), curr, ef, /*layer=*/0, predicate);
+        auto candidates = search_layer_query_filtered(query.data(), curr, ef, /*layer=*/0,
+                                                      scratch, predicate);
         const std::size_t take = std::min(k, candidates.size());
 
         std::vector<SearchResult> out;
@@ -1421,15 +1424,43 @@ private:
         return 0.f;
     }
 
-    float distance_query(const float* q, int node) const {
+    /// Per-search working memory (stack-allocated / local to each search call).
+    /// Must not be shared across threads — this is what makes concurrent `search` safe.
+    struct SearchScratch {
+        float query_norm = 0.f;
+        std::vector<std::uint32_t> visit_mark;
+        std::uint32_t visit_tick = 0;
+
+        void begin_visit(std::size_t n) {
+            if (visit_mark.size() < n) {
+                visit_mark.assign(n, 0);
+                visit_tick = 1;
+            }
+            ++visit_tick;
+            if (visit_tick == 0) {
+                std::fill(visit_mark.begin(), visit_mark.end(), 0);
+                visit_tick = 1;
+            }
+        }
+
+        bool visited(int node) const {
+            return visit_mark[static_cast<std::size_t>(node)] == visit_tick;
+        }
+
+        void mark_visited(int node) {
+            visit_mark[static_cast<std::size_t>(node)] = visit_tick;
+        }
+    };
+
+    float distance_query(const float* q, int node, float query_norm) const {
         const float* p = data_.data() + static_cast<std::size_t>(node) * dimension_;
         switch (metric_) {
             case Metric::Cosine: {
                 const float nb = norms_[static_cast<std::size_t>(node)];
-                if (query_norm_ == 0.f || nb == 0.f) {
+                if (query_norm == 0.f || nb == 0.f) {
                     return 1.f;
                 }
-                return 1.f - inner_product(q, p, dimension_) / (query_norm_ * nb);
+                return 1.f - inner_product(q, p, dimension_) / (query_norm * nb);
             }
             case Metric::Euclidean:
                 return simd::squared_l2(q, p, dimension_);
@@ -1437,26 +1468,6 @@ private:
                 return -inner_product(q, p, dimension_);
         }
         return 0.f;
-    }
-
-    void begin_visit() const {
-        if (visit_mark_.size() < ids_.size()) {
-            visit_mark_.assign(ids_.size(), 0);
-            visit_tick_ = 1;
-        }
-        ++visit_tick_;
-        if (visit_tick_ == 0) {
-            std::fill(visit_mark_.begin(), visit_mark_.end(), 0);
-            visit_tick_ = 1;
-        }
-    }
-
-    bool visited(int node) const {
-        return visit_mark_[static_cast<std::size_t>(node)] == visit_tick_;
-    }
-
-    void mark_visited(int node) const {
-        visit_mark_[static_cast<std::size_t>(node)] = visit_tick_;
     }
 
     int random_level() {
@@ -1485,16 +1496,16 @@ private:
         return curr;
     }
 
-    int greedy_update_query(const float* q, int enter, int layer) const {
+    int greedy_update_query(const float* q, int enter, int layer, SearchScratch& scratch) const {
         int curr = enter;
-        float d = distance_query(q, curr);
+        float d = distance_query(q, curr, scratch.query_norm);
         bool changed = true;
         while (changed) {
             changed = false;
             const auto& links =
                 neighbors_[static_cast<std::size_t>(curr)][static_cast<std::size_t>(layer)];
             for (int nb : links) {
-                const float dn = distance_query(q, nb);
+                const float dn = distance_query(q, nb, scratch.query_norm);
                 if (dn < d) {
                     d = dn;
                     curr = nb;
@@ -1508,10 +1519,12 @@ private:
     std::vector<DistNode> search_layer(int query_node, bool /*query_is_node*/, int enter,
                                        std::size_t ef, int layer) const {
         const float* q = data_.data() + static_cast<std::size_t>(query_node) * dimension_;
+        SearchScratch scratch;
         if (metric_ == Metric::Cosine) {
-            query_norm_ = norms_[static_cast<std::size_t>(query_node)];
+            scratch.query_norm = norms_[static_cast<std::size_t>(query_node)];
         }
-        return search_layer_query_filtered(q, enter, ef, layer, [](std::int64_t) { return true; });
+        return search_layer_query_filtered(q, enter, ef, layer, scratch,
+                                           [](std::int64_t) { return true; });
     }
 
     /// Layer search with id filter applied to the *eligible result* set only.
@@ -1522,19 +1535,22 @@ private:
     /// has fewer than `ef` hits, or its distance is better than the worst eligible.
     /// Farther ineligible bridges are therefore skipped once the eligible set is full,
     /// which can reduce recall under very selective predicates.
+    ///
+    /// `scratch` is caller-owned per-search state (not shared across threads).
     template <typename Pred>
     std::vector<DistNode> search_layer_query_filtered(const float* q, int enter, std::size_t ef,
-                                                      int layer, Pred predicate) const {
-        begin_visit();
+                                                      int layer, SearchScratch& scratch,
+                                                      Pred predicate) const {
+        scratch.begin_visit(ids_.size());
 
         // Exploration frontier (all nodes, for connectivity).
         std::priority_queue<DistNode, std::vector<DistNode>, std::greater<DistNode>> candidates;
         // Eligible dynamic list only (max-heap, size <= ef).
         std::priority_queue<DistNode> eligible;
 
-        const float d0 = distance_query(q, enter);
+        const float d0 = distance_query(q, enter, scratch.query_norm);
         candidates.emplace(d0, enter);
-        mark_visited(enter);
+        scratch.mark_visited(enter);
         if (predicate(ids_[static_cast<std::size_t>(enter)])) {
             eligible.emplace(d0, enter);
         }
@@ -1552,11 +1568,11 @@ private:
             const auto& links =
                 neighbors_[static_cast<std::size_t>(c.second)][static_cast<std::size_t>(layer)];
             for (int nb : links) {
-                if (visited(nb)) {
+                if (scratch.visited(nb)) {
                     continue;
                 }
-                mark_visited(nb);
-                const float d = distance_query(q, nb);
+                scratch.mark_visited(nb);
+                const float d = distance_query(q, nb, scratch.query_norm);
                 // Expand while eligible list is not full, or this node is closer than
                 // the worst eligible (may improve results or path through ineligible).
                 if (eligible.size() < ef || d < eligible.top().first) {
@@ -1595,6 +1611,8 @@ private:
     std::size_t dimension_;
     Metric metric_;
     HnswParams params_;
+    // Level sampling in add(); streamed in const save(). Not used by search.
+    // Concurrent search is safe while the graph is immutable; concurrent add is not.
     mutable std::mt19937_64 rng_;
     double level_mult_;
 
@@ -1605,12 +1623,6 @@ private:
     std::vector<std::vector<std::vector<int>>> neighbors_;
     int entry_point_ = -1;
     int max_level_ = -1;
-
-    // Search-time caches (not serialized). Mutable so `search` can be const for
-    // callers, but **not** safe for concurrent search on the same instance.
-    mutable float query_norm_ = 0.f;
-    mutable std::vector<std::uint32_t> visit_mark_;
-    mutable std::uint32_t visit_tick_ = 0;
 };
 
 // ---------------------------------------------------------------------------

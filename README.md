@@ -160,7 +160,7 @@ Binary format: magic `TANN`, version, kind (`exact` / `hnsw` / `ivf` / `sq`), me
 ### API notes (from design review)
 
 - **Finite vectors:** `add` / `update` / `search` reject NaN/Inf components.
-- **HNSW concurrency:** do not call `search` concurrently on the **same** `HnswIndex` instance (mutable visit/query caches). Use separate instances or external locking.
+- **HNSW concurrency:** concurrent `search` on the **same** `HnswIndex` is safe (per-call visit/query scratch). Do not interleave `search` with concurrent `add`/`remove`/`update` (no writer locks).
 - **HNSW / IVF capacity:** internal node indices are `int`; `add` fails if `size() >= INT_MAX`.
 - **`add` exception safety:** basic guarantee only (a throw while growing storage may leave partial state).
 - **Filtered HNSW:** not a post-filter of unfiltered top‑k; very selective filters may miss some eligibles once the eligible heap is full (raise `ef` or use exact search for perfect filtered recall).
