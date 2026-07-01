@@ -2487,6 +2487,13 @@ struct IvfPqParams {
 /// Stores only M-byte codes per vector (plus inverted lists / centroids / codebooks).
 /// Suitable for large corpora where full-float IVF or HNSW RAM is prohibitive.
 /// Concurrent search is safe while the index is immutable (no concurrent train/add).
+///
+/// **Metrics (consistent with `Index` / `IvfIndex` / `HnswIndex`):**
+/// - **Euclidean:** residual L2 ADC (approx squared residual distance; lower better).
+/// - **InnerProduct:** asymmetric IP ADC on residual reconstruction (higher better).
+/// - **Cosine:** inputs are **L2-normalized** on train/add/update/search (scale-invariant
+///   like true cosine); ranking uses the IP ADC path on the unit sphere, then final
+///   hit scores are true `cosine_similarity(query, reconstruct(code))`.
 class IvfPqIndex {
 public:
     /// Fixed 8-bit codes per subspace (FAISS default ksub = 256).
@@ -2514,6 +2521,7 @@ public:
     }
 
     /// Train coarse IVF centroids and PQ codebooks on residuals. Clears any vectors.
+    /// For `Metric::Cosine`, training vectors are L2-normalized (scale-invariant).
     void train(const std::vector<std::vector<float>>& training) {
         if (training.empty()) {
             throw std::invalid_argument("tinyann::IvfPqIndex::train: empty training set");
@@ -2526,8 +2534,18 @@ public:
         }
 
         clear_data();
-        train_coarse(training);
-        train_pq_codebooks(training);
+        // Cosine: train on unit vectors so coarse/PQ geometry matches true cosine ranking.
+        const std::vector<std::vector<float>>* train_ptr = &training;
+        std::vector<std::vector<float>> train_unit;
+        if (metric_ == Metric::Cosine) {
+            train_unit = training;
+            for (auto& v : train_unit) {
+                l2_normalize_inplace(v.data());
+            }
+            train_ptr = &train_unit;
+        }
+        train_coarse(*train_ptr);
+        train_pq_codebooks(*train_ptr);
         trained_ = true;
     }
 
@@ -2546,10 +2564,18 @@ public:
                 "tinyann::IvfPqIndex::add: maximum number of nodes (INT_MAX) reached");
         }
 
+        const float* vp = vector.data();
+        std::vector<float> unit;
+        if (metric_ == Metric::Cosine) {
+            unit = vector;
+            l2_normalize_inplace(unit.data());
+            vp = unit.data();
+        }
+
         const int node = static_cast<int>(ids_.size());
-        const std::size_t list = nearest_centroid(vector.data());
+        const std::size_t list = nearest_centroid(vp);
         std::vector<std::uint8_t> code(params_.M);
-        encode_residual(vector.data(), list, code.data());
+        encode_residual(vp, list, code.data());
 
         ids_.push_back(id);
         list_of_.push_back(list);
@@ -2575,6 +2601,13 @@ public:
                 std::to_string(dimension_) + ", got " + std::to_string(vector.size()) + ")");
         }
         require_finite(vector, "tinyann::IvfPqIndex::update");
+        const float* vp = vector.data();
+        std::vector<float> unit;
+        if (metric_ == Metric::Cosine) {
+            unit = vector;
+            l2_normalize_inplace(unit.data());
+            vp = unit.data();
+        }
         bool updated = false;
         for (std::size_t i = 0; i < ids_.size(); ++i) {
             if (ids_[i] != id) {
@@ -2584,10 +2617,10 @@ public:
             auto& lst = lists_[old_list];
             lst.erase(std::remove(lst.begin(), lst.end(), static_cast<int>(i)), lst.end());
 
-            const std::size_t new_list = nearest_centroid(vector.data());
+            const std::size_t new_list = nearest_centroid(vp);
             list_of_[i] = new_list;
             lists_[new_list].push_back(static_cast<int>(i));
-            encode_residual(vector.data(), new_list, codes_.data() + i * params_.M);
+            encode_residual(vp, new_list, codes_.data() + i * params_.M);
             updated = true;
         }
         return updated;
@@ -2595,6 +2628,20 @@ public:
 
     bool contains(std::int64_t id) const {
         return std::find(ids_.begin(), ids_.end(), id) != ids_.end();
+    }
+
+    /// Reconstruct approximate float vector for node `i` (coarse + PQ residual decode).
+    void reconstruct(std::size_t i, float* out) const {
+        if (i >= ids_.size()) {
+            throw std::out_of_range("tinyann::IvfPqIndex::reconstruct");
+        }
+        reconstruct_from_code(list_of_[i], codes_.data() + i * params_.M, out);
+    }
+
+    std::vector<float> reconstruct(std::size_t i) const {
+        std::vector<float> out(dimension_);
+        reconstruct(i, out.data());
+        return out;
     }
 
     std::vector<SearchResult> search(const std::vector<float>& query, std::size_t k) const {
@@ -2615,8 +2662,17 @@ public:
             return {};
         }
 
+        // Cosine: search on unit query (matches train/add normalization).
+        const float* qp = query.data();
+        std::vector<float> q_unit;
+        if (metric_ == Metric::Cosine) {
+            q_unit = query;
+            l2_normalize_inplace(q_unit.data());
+            qp = q_unit.data();
+        }
+
         const std::size_t nprobe = std::min(params_.nprobe, params_.nlist);
-        auto lists = probe_lists(query.data(), nprobe);
+        auto lists = probe_lists(qp, nprobe);
 
         std::vector<SearchResult> eligible;
         eligible.reserve(k * 4);
@@ -2625,18 +2681,36 @@ public:
         // the coarse centroid).
         std::vector<float> table(params_.M * kSub);
         std::vector<float> residual(dimension_);
+        std::vector<float> recon(dimension_);
 
         for (std::size_t li : lists) {
-            build_adc_table(query.data(), li, residual.data(), table.data());
-            const float list_base = list_base_score(query.data(), li);
-            for (int node : lists_[li]) {
-                const std::int64_t id = ids_[static_cast<std::size_t>(node)];
-                if (!predicate(id)) {
-                    continue;
+            if (metric_ == Metric::Cosine) {
+                // Rank by true cosine(q_unit, reconstruct(code)) — same definition as Index.
+                for (int node : lists_[li]) {
+                    const std::int64_t id = ids_[static_cast<std::size_t>(node)];
+                    if (!predicate(id)) {
+                        continue;
+                    }
+                    const std::uint8_t* code =
+                        codes_.data() + static_cast<std::size_t>(node) * params_.M;
+                    reconstruct_from_code(li, code, recon.data());
+                    eligible.push_back(
+                        SearchResult{id, cosine_similarity(qp, recon.data(), dimension_)});
                 }
-                const std::uint8_t* code = codes_.data() + static_cast<std::size_t>(node) * params_.M;
-                const float score = list_base + adc_from_table(code, table.data());
-                eligible.push_back(SearchResult{id, score});
+            } else {
+                // IP / Euclidean: asymmetric distance computation (no full float corpus).
+                build_adc_table(qp, li, residual.data(), table.data());
+                const float list_base = list_base_score(qp, li);
+                for (int node : lists_[li]) {
+                    const std::int64_t id = ids_[static_cast<std::size_t>(node)];
+                    if (!predicate(id)) {
+                        continue;
+                    }
+                    const std::uint8_t* code =
+                        codes_.data() + static_cast<std::size_t>(node) * params_.M;
+                    eligible.push_back(
+                        SearchResult{id, list_base + adc_from_table(code, table.data())});
+                }
             }
         }
         if (eligible.empty()) {
@@ -2985,6 +3059,31 @@ private:
         }
     }
 
+    /// L2-normalize in place. Zero vector left unchanged (cosine with it stays 0).
+    void l2_normalize_inplace(float* v) const {
+        const float n = l2_norm(v, dimension_);
+        if (n > 0.f) {
+            const float inv = 1.f / n;
+            for (std::size_t d = 0; d < dimension_; ++d) {
+                v[d] *= inv;
+            }
+        }
+    }
+
+    /// x̂ = coarse_centroid[list] + Σ_m codebook[m][code[m]]
+    void reconstruct_from_code(std::size_t list, const std::uint8_t* code, float* out) const {
+        const float* c = centroids_.data() + list * dimension_;
+        std::copy(c, c + dimension_, out);
+        const std::size_t ds = dsub();
+        for (std::size_t m = 0; m < params_.M; ++m) {
+            const float* cb = codebook_entry(m, code[m]);
+            float* dst = out + m * ds;
+            for (std::size_t d = 0; d < ds; ++d) {
+                dst[d] += cb[d];
+            }
+        }
+    }
+
     void train_pq_codebooks(const std::vector<std::vector<float>>& training) {
         const std::size_t nt = training.size();
         const std::size_t ds = dsub();
@@ -3095,11 +3194,10 @@ private:
         }
     }
 
-    /// Base term independent of code for a given coarse list.
-    /// Euclidean: 0 (all distance is in residual ADC).
-    /// IP / Cosine: IP(q, coarse_centroid).
+    /// Base term independent of code for a given coarse list (InnerProduct only).
+    /// Euclidean: 0 (distance fully in residual ADC). Cosine uses reconstruct path.
     float list_base_score(const float* q, std::size_t list) const {
-        if (metric_ == Metric::Euclidean) {
+        if (metric_ != Metric::InnerProduct) {
             return 0.f;
         }
         return inner_product(q, centroids_.data() + list * dimension_, dimension_);
@@ -3118,10 +3216,8 @@ private:
                 }
             }
         } else {
-            // IP / Cosine: table[m][k] = IP(q_m, codebook[m][k]) on residual subspace.
-            // Full score = IP(q, centroid) + sum_m table[m][code]  (since x≈c+decode(r)).
-            // Use full query subspace (not residual query) for IP with residual codes:
-            // IP(q, c + r_hat) = IP(q,c) + IP(q, r_hat); r_hat from codebook on residual.
+            // InnerProduct (and unused for Cosine search path): IP(q_m, codebook[m][k]).
+            // IP(q, c + r_hat) = IP(q,c) + IP(q, r_hat).
             for (std::size_t m = 0; m < params_.M; ++m) {
                 const float* qm = q + m * ds;
                 for (std::size_t c = 0; c < kSub; ++c) {
@@ -3136,11 +3232,6 @@ private:
         for (std::size_t m = 0; m < params_.M; ++m) {
             s += table[m * kSub + code[m]];
         }
-        if (metric_ == Metric::Euclidean) {
-            // squared L2 residual distance (order-preserving for ranking)
-            return s;
-        }
-        // IP / Cosine: higher is better (sum of IP contributions)
         return s;
     }
 

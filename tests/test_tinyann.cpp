@@ -1708,6 +1708,57 @@ void test_hnsw_filtered_recall() {
     CHECK_NEAR(rec_all, rec_unf, 1e-12);
 }
 
+void test_ivfpq_cosine_scale_invariant() {
+    // Exact cosine prefers same direction over longer IP; unnormalized data must not
+    // make IVFPQ cosine behave like IP.
+    const std::size_t dim = 8;
+    tinyann::IvfPqParams p;
+    p.nlist = 2;
+    p.nprobe = 2;
+    p.M = 2;
+    p.kmeans_iters = 15;
+    p.pq_kmeans_iters = 15;
+    p.seed = 1;
+
+    // a: short, aligned with e0; b: long, 45° from e0 — cosine(q,a)=1 > cosine(q,b).
+    std::vector<float> a(dim, 0.f);
+    a[0] = 0.01f;
+    std::vector<float> b(dim, 0.f);
+    b[0] = 100.f;
+    b[1] = 100.f;
+    std::mt19937_64 rng(2);
+
+    std::vector<std::vector<float>> train = {a, b, random_unit_vector(dim, rng),
+                                             random_unit_vector(dim, rng),
+                                             random_unit_vector(dim, rng),
+                                             random_unit_vector(dim, rng)};
+    tinyann::IvfPqIndex cos_idx(dim, tinyann::Metric::Cosine, p);
+    cos_idx.train(train);
+    cos_idx.add(1, a);
+    cos_idx.add(2, b);
+
+    tinyann::Index exact(dim, tinyann::Metric::Cosine);
+    exact.add(1, a);
+    exact.add(2, b);
+
+    std::vector<float> q(dim, 0.f);
+    q[0] = 1.f;
+    const auto exact_hits = exact.search(q, 2);
+    CHECK(exact_hits[0].id == 1);  // cosine prefers short aligned a
+    CHECK_NEAR(exact_hits[0].score, 1.0, 1e-5);
+
+    tinyann::Index ip_idx(dim, tinyann::Metric::InnerProduct);
+    ip_idx.add(1, a);
+    ip_idx.add(2, b);
+    const auto ip_hits = ip_idx.search(q, 2);
+    CHECK(ip_hits[0].id == 2);  // IP prefers long b
+
+    const auto cos_hits = cos_idx.search(q, 2);
+    CHECK(cos_hits.size() == 2);
+    CHECK(cos_hits[0].id == 1);  // must match cosine, not IP
+    CHECK(cos_hits[0].score > cos_hits[1].score);
+}
+
 void test_ivfpq_rejects_bad_m() {
     tinyann::IvfPqParams p;
     p.M = 3;  // 32 % 3 != 0
@@ -1949,6 +2000,7 @@ int main() {
     test_ivf_remove_update();
     test_ivfpq_rejects_bad_m();
     test_ivfpq_basic_search_and_filter();
+    test_ivfpq_cosine_scale_invariant();
     test_ivfpq_recall();
     test_ivfpq_save_load();
     test_ivfpq_remove_update();

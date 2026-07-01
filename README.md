@@ -174,7 +174,7 @@ Vector file: optional integer `<id>` then `<f1> … <fN>` per line (`#` comments
 
 Binary format: magic `TANN`, version, kind (`exact` / `hnsw` / `ivf` / `sq` / `ivfpq`), metric, dimension, ids, vectors (or PQ codes for IVFPQ); HNSW also stores params, entry point, levels, adjacency lists, and RNG state. **Host-endian only** — files are not portable across different-endian machines (no endian marker in the header).
 
-**IVFPQ notes:** residual product quantization (encode `x - coarse_centroid`). Euclidean search ranks by approximate **squared** residual L2 via ADC. Cosine / inner product use asymmetric IP tables plus the coarse term. Best for large static-ish corpora; train once, then `add` / `search` / `save` / `load`.
+**IVFPQ notes:** residual product quantization (encode `x - coarse_centroid`). **Euclidean:** approx squared residual L2 via ADC. **Inner product:** asymmetric IP ADC (`IP(q,c)+IP(q,decode)`). **Cosine:** train/add/search L2-normalize (scale-invariant, same spirit as true cosine elsewhere in tinyann); scores are `cosine_similarity(query, reconstruct(code))`. Best for large static-ish corpora; train once, then `add` / `search` / `save` / `load`.
 
 ### API notes (from design review)
 
