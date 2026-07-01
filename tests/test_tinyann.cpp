@@ -1879,6 +1879,68 @@ void test_ivfpq_save_load() {
     CHECK(results_byte_identical(before, loaded.search(q, 8)));
 }
 
+void test_ivfpq_opq_basic_and_save_load() {
+    const std::size_t dim = 32;
+    tinyann::IvfPqParams p;
+    p.nlist = 8;
+    p.nprobe = 8;
+    p.M = 8;
+    p.kmeans_iters = 12;
+    p.pq_kmeans_iters = 12;
+    p.use_opq = true;
+    p.opq_iters = 4;
+    p.seed = 3;
+
+    tinyann::IvfPqIndex idx(dim, tinyann::Metric::InnerProduct, p);
+    std::mt19937_64 rng(11);
+    // Correlated dimensions: second half copies first half (axis-aligned PQ is weak).
+    std::vector<std::vector<float>> all;
+    for (int i = 0; i < 300; ++i) {
+        auto v = random_unit_vector(dim / 2, rng);
+        std::vector<float> full(dim);
+        for (std::size_t d = 0; d < dim / 2; ++d) {
+            full[d] = v[d];
+            full[d + dim / 2] = v[d];
+        }
+        // renorm
+        float n2 = 0.f;
+        for (float x : full) {
+            n2 += x * x;
+        }
+        if (n2 > 0.f) {
+            const float inv = 1.f / std::sqrt(n2);
+            for (float& x : full) {
+                x *= inv;
+            }
+        }
+        all.push_back(std::move(full));
+    }
+    idx.train(all);
+    CHECK(idx.uses_opq());
+    CHECK(idx.opq_matrix().size() == dim * dim);
+    for (int i = 0; i < 300; ++i) {
+        idx.add(i, all[static_cast<std::size_t>(i)]);
+    }
+    auto hits = idx.search(all[0], 5);
+    CHECK(hits.size() == 5);
+    CHECK(hits[0].id == 0);
+
+    const std::string path = temp_path("tinyann_ivfpq_opq.bin");
+    idx.save(path);
+    auto loaded = tinyann::IvfPqIndex::load(path);
+    CHECK(loaded.uses_opq());
+    CHECK(results_byte_identical(hits, loaded.search(all[0], 5)));
+
+    // Without OPQ still trains (identity path, no matrix stored).
+    tinyann::IvfPqParams p2 = p;
+    p2.use_opq = false;
+    tinyann::IvfPqIndex plain(dim, tinyann::Metric::InnerProduct, p2);
+    plain.train(all);
+    CHECK(!plain.uses_opq());
+    plain.add(0, all[0]);
+    CHECK(!plain.search(all[0], 1).empty());
+}
+
 void test_ivfpq_remove_update() {
     tinyann::IvfPqParams p;
     p.nlist = 4;
@@ -2003,6 +2065,7 @@ int main() {
     test_ivfpq_cosine_scale_invariant();
     test_ivfpq_recall();
     test_ivfpq_save_load();
+    test_ivfpq_opq_basic_and_save_load();
     test_ivfpq_remove_update();
     test_sq_quantize_dequantize();
     test_index_sq_search_and_recall();
