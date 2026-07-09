@@ -5,6 +5,9 @@ set(CMAKE_CXX_STANDARD 17)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
 set(CMAKE_CXX_EXTENSIONS OFF)
 
+option(TINYANN_BUILD_CLI "Build tinyann CLI binary" ON)
+option(TINYANN_BUILD_TESTS "Build tinyann unit tests" ON)
+
 # Header-only style library target (interface) for consumers; CLI/tests compile against it.
 add_library(tinyann INTERFACE)
 add_library(tinyann::tinyann ALIAS tinyann)
@@ -33,16 +36,18 @@ if(TINYANN_ENABLE_AVX2)
   endif()
 endif()
 
-# CLI executable
-add_executable(tinyann_cli src/cli.cpp)
-target_link_libraries(tinyann_cli PRIVATE tinyann)
-set_target_properties(tinyann_cli PROPERTIES OUTPUT_NAME tinyann)
+if(TINYANN_BUILD_CLI)
+  add_executable(tinyann_cli src/cli.cpp)
+  target_link_libraries(tinyann_cli PRIVATE tinyann)
+  set_target_properties(tinyann_cli PROPERTIES OUTPUT_NAME tinyann)
+  install(TARGETS tinyann_cli RUNTIME DESTINATION bin)
+endif()
 
-# Unit tests
-enable_testing()
-add_executable(tinyann_tests tests/test_tinyann.cpp)
-target_link_libraries(tinyann_tests PRIVATE tinyann)
-add_test(NAME tinyann_unit_tests COMMAND tinyann_tests)
+if(TINYANN_BUILD_TESTS)
+  enable_testing()
+  add_executable(tinyann_tests tests/test_tinyann.cpp)
+  target_link_libraries(tinyann_tests PRIVATE tinyann)
+  add_test(NAME tinyann_unit_tests COMMAND tinyann_tests)
+endif()
 
-install(TARGETS tinyann_cli RUNTIME DESTINATION bin)
 install(DIRECTORY include/tinyann DESTINATION include)
