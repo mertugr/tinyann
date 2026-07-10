@@ -1,0 +1,36 @@
+name: ci
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+jobs:
+  build-and-test:
+    runs-on: ubuntu-latest
+    steps:
+      # v5+ runs on Node 24 (v4 targets Node 20, deprecated on GH runners).
+      - uses: actions/checkout@v5
+      - name: Install toolchain
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y cmake g++
+      - name: Configure & build
+        run: |
+          cmake -S . -B build -DCMAKE_BUILD_TYPE=Release \
+            -DTINYANN_BUILD_TESTS=ON \
+            -DTINYANN_BUILD_CLI=ON
+          cmake --build build -j$(nproc)
+      - name: Unit tests
+        run: ./build/tinyann_tests
+      - name: CTest
+        run: ctest --test-dir build --output-on-failure
+      - name: CLI smoke
+        run: |
+          ./build/tinyann --dim 3 --metric cosine \
+            --vectors data/vectors.txt --query data/query.txt --k 3 \
+            --index hnsw --ef 64 --M 16 --recall
+          ./build/tinyann --dim 3 --metric cosine --vectors data/vectors.txt \
+            --index exact --save /tmp/exact.tann
+          ./build/tinyann --load /tmp/exact.tann --index exact \
+            --query data/query.txt --k 3

@@ -202,4 +202,4 @@ Equal scores tie-break by smaller `id`.
 
 ## License
 
-MIT (or as specified by the repository owner).
+MIT — see [LICENSE](LICENSE).
