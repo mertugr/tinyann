@@ -1,7 +1,12 @@
 # tinyann
 
+**Version:** `0.1.0` · **License:** MIT · **C++17** · header-only library + CLI  
+**Compatibility:** [COMPATIBILITY.md](COMPATIBILITY.md) (formats, stack consumers)
+
 Small **C++17** in-memory vector similarity search library with a CLI.
 Distance kernels use **SIMD** when available (AVX2 / SSE2 / ARM NEON, with scalar fallback).
+
+**Stack:** used by [nanorag](https://github.com/mertugr/nanorag) (≥ tinyann **0.1.0**) for dense HNSW + cosine retrieval; works standalone for exact/HNSW/IVF/IVFPQ/SQ.
 
 ## Features
 
@@ -203,3 +208,5 @@ Equal scores tie-break by smaller `id`.
 ## License
 
 MIT — see [LICENSE](LICENSE).
+
+Binary formats, package consumers, and stack matrix: [COMPATIBILITY.md](COMPATIBILITY.md).
