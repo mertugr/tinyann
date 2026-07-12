@@ -1325,14 +1325,17 @@ private:
 
         if (idx != last) {
             // Swap-remove: move last node into the freed slot.
-            ids_[static_cast<std::size_t>(idx)] = ids_[static_cast<std::size_t>(last)];
-            std::copy(data_.begin() + static_cast<std::ptrdiff_t>(last * static_cast<int>(dimension_)),
-                      data_.begin() + static_cast<std::ptrdiff_t>((last + 1) * static_cast<int>(dimension_)),
-                      data_.begin() + static_cast<std::ptrdiff_t>(idx * static_cast<int>(dimension_)));
-            norms_[static_cast<std::size_t>(idx)] = norms_[static_cast<std::size_t>(last)];
-            levels_[static_cast<std::size_t>(idx)] = levels_[static_cast<std::size_t>(last)];
-            neighbors_[static_cast<std::size_t>(idx)] =
-                std::move(neighbors_[static_cast<std::size_t>(last)]);
+            // Offsets in size_t (like exact Index) — avoid signed int n*dim overflow.
+            const std::size_t dim = dimension_;
+            const std::size_t last_u = static_cast<std::size_t>(last);
+            const std::size_t idx_u = static_cast<std::size_t>(idx);
+            ids_[idx_u] = ids_[last_u];
+            std::copy(data_.begin() + static_cast<std::ptrdiff_t>(last_u * dim),
+                      data_.begin() + static_cast<std::ptrdiff_t>((last_u + 1) * dim),
+                      data_.begin() + static_cast<std::ptrdiff_t>(idx_u * dim));
+            norms_[idx_u] = norms_[last_u];
+            levels_[idx_u] = levels_[last_u];
+            neighbors_[idx_u] = std::move(neighbors_[last_u]);
 
             // Remap any neighbor index that still points at `last` -> `idx`.
             // Only nodes 0..last-1 remain meaningful; neighbors_[idx] is the moved last.
@@ -2158,12 +2161,16 @@ private:
             auto& ll = lists_[last_list];
             ll.erase(std::remove(ll.begin(), ll.end(), last), ll.end());
 
-            ids_[static_cast<std::size_t>(idx)] = ids_[static_cast<std::size_t>(last)];
-            std::copy(data_.begin() + static_cast<std::ptrdiff_t>(last * static_cast<int>(dimension_)),
-                      data_.begin() + static_cast<std::ptrdiff_t>((last + 1) * static_cast<int>(dimension_)),
-                      data_.begin() + static_cast<std::ptrdiff_t>(idx * static_cast<int>(dimension_)));
-            list_of_[static_cast<std::size_t>(idx)] = list_of_[static_cast<std::size_t>(last)];
-            lists_[list_of_[static_cast<std::size_t>(idx)]].push_back(idx);
+            // Offsets in size_t (like exact Index) — avoid signed int n*dim overflow.
+            const std::size_t dim = dimension_;
+            const std::size_t last_u = static_cast<std::size_t>(last);
+            const std::size_t idx_u = static_cast<std::size_t>(idx);
+            ids_[idx_u] = ids_[last_u];
+            std::copy(data_.begin() + static_cast<std::ptrdiff_t>(last_u * dim),
+                      data_.begin() + static_cast<std::ptrdiff_t>((last_u + 1) * dim),
+                      data_.begin() + static_cast<std::ptrdiff_t>(idx_u * dim));
+            list_of_[idx_u] = list_of_[last_u];
+            lists_[list_of_[idx_u]].push_back(idx);
         }
 
         ids_.pop_back();
@@ -2718,6 +2725,12 @@ public:
                 const float* raw =
                     raw_data_.data() + static_cast<std::size_t>(c.node) * dimension_;
                 c.score = metric_score(metric_, query.data(), raw, dimension_);
+            }
+        } else if (metric_ == Metric::Euclidean) {
+            // ADC tables store squared residual L2 for ranking; expose true L2
+            // so scores match exact Index / HNSW / IVF (metric_score contract).
+            for (auto& c : cands) {
+                c.score = std::sqrt(std::max(0.f, c.score));
             }
         }
         return take_topk_from_cands(cands, k);
@@ -3673,28 +3686,32 @@ private:
         auto& lst = lists_[list];
         lst.erase(std::remove(lst.begin(), lst.end(), idx), lst.end());
 
+        // Offsets in size_t (like exact Index) — avoid signed int n*M / n*dim overflow.
+        const std::size_t last_u = static_cast<std::size_t>(last);
+        const std::size_t idx_u = static_cast<std::size_t>(idx);
+        const std::size_t M = params_.M;
+        const std::size_t dim = dimension_;
+
         if (idx != last) {
-            const std::size_t last_list = list_of_[static_cast<std::size_t>(last)];
+            const std::size_t last_list = list_of_[last_u];
             auto& ll = lists_[last_list];
             ll.erase(std::remove(ll.begin(), ll.end(), last), ll.end());
 
-            ids_[static_cast<std::size_t>(idx)] = ids_[static_cast<std::size_t>(last)];
-            list_of_[static_cast<std::size_t>(idx)] = list_of_[static_cast<std::size_t>(last)];
-            std::copy(codes_.begin() + static_cast<std::ptrdiff_t>(last * static_cast<int>(params_.M)),
-                      codes_.begin() + static_cast<std::ptrdiff_t>((last + 1) * static_cast<int>(params_.M)),
-                      codes_.begin() + static_cast<std::ptrdiff_t>(idx * static_cast<int>(params_.M)));
-            lists_[list_of_[static_cast<std::size_t>(idx)]].push_back(idx);
+            ids_[idx_u] = ids_[last_u];
+            list_of_[idx_u] = list_of_[last_u];
+            std::copy(codes_.begin() + static_cast<std::ptrdiff_t>(last_u * M),
+                      codes_.begin() + static_cast<std::ptrdiff_t>((last_u + 1) * M),
+                      codes_.begin() + static_cast<std::ptrdiff_t>(idx_u * M));
+            lists_[list_of_[idx_u]].push_back(idx);
         }
 
-        if (params_.store_raw && raw_data_.size() == static_cast<std::size_t>(n) * dimension_) {
+        if (params_.store_raw && raw_data_.size() == static_cast<std::size_t>(n) * dim) {
             if (idx != last) {
-                std::copy(
-                    raw_data_.begin() + static_cast<std::ptrdiff_t>(last * static_cast<int>(dimension_)),
-                    raw_data_.begin() +
-                        static_cast<std::ptrdiff_t>((last + 1) * static_cast<int>(dimension_)),
-                    raw_data_.begin() + static_cast<std::ptrdiff_t>(idx * static_cast<int>(dimension_)));
+                std::copy(raw_data_.begin() + static_cast<std::ptrdiff_t>(last_u * dim),
+                          raw_data_.begin() + static_cast<std::ptrdiff_t>((last_u + 1) * dim),
+                          raw_data_.begin() + static_cast<std::ptrdiff_t>(idx_u * dim));
             }
-            raw_data_.resize(static_cast<std::size_t>(last) * dimension_);
+            raw_data_.resize(last_u * dim);
         }
 
         ids_.pop_back();

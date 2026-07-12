@@ -2077,6 +2077,80 @@ void test_ivfpq_opq_better_than_pq() {
     CHECK(rec_opq > 0.45);
 }
 
+/// IVFPQ Euclidean public scores must be L2 (not squared residual), matching exact Index scale.
+void test_ivfpq_euclidean_scores_are_l2_not_squared() {
+    const std::size_t dim = 32;
+    const std::size_t n = 300;
+    const std::size_t k = 10;
+    tinyann::IvfPqParams p;
+    p.nlist = 16;
+    p.nprobe = 16;
+    p.M = 8;
+    p.kmeans_iters = 15;
+    p.pq_kmeans_iters = 15;
+    p.seed = 21;
+    p.nrefine = 0;
+    p.store_raw = false;
+
+    tinyann::Index exact(dim, tinyann::Metric::Euclidean);
+    tinyann::IvfPqIndex ivfpq(dim, tinyann::Metric::Euclidean, p);
+    std::mt19937_64 rng(33);
+    std::vector<std::vector<float>> all;
+    all.reserve(n);
+    for (std::size_t i = 0; i < n; ++i) {
+        // Non-unit vectors so L2 distances are not tiny (squared vs L2 clearly differs).
+        auto v = random_unit_vector(dim, rng);
+        for (float& x : v) {
+            x *= 3.f;
+        }
+        all.push_back(std::move(v));
+    }
+    ivfpq.train(all);
+    for (std::size_t i = 0; i < n; ++i) {
+        exact.add(static_cast<std::int64_t>(i), all[i]);
+        ivfpq.add(static_cast<std::int64_t>(i), all[i]);
+    }
+
+    const auto q = all[0];
+    const auto approx = ivfpq.search(q, k, /*nrefine=*/0);
+    const auto truth = exact.search(q, k);
+    CHECK(approx.size() == k);
+    CHECK(truth.size() == k);
+
+    // ADC score after sqrt must match L2 to PQ reconstruction (not squared L2).
+    for (const auto& hit : approx) {
+        std::size_t node = 0;
+        while (node < ivfpq.ids().size() && ivfpq.ids()[node] != hit.id) {
+            ++node;
+        }
+        CHECK(node < ivfpq.ids().size());
+        const auto recon = ivfpq.reconstruct(node);
+        const float l2 = tinyann::euclidean_distance(q.data(), recon.data(), dim);
+        const float l2_sq = l2 * l2;
+        CHECK_NEAR(hit.score, l2, 1e-3);
+        // Must not be reporting squared distance as the public score.
+        CHECK(std::fabs(hit.score - l2_sq) > std::fabs(hit.score - l2) || l2 < 1e-4f);
+    }
+
+    // Same-id hits: approx score should track exact Index L2 scale, not L2^2.
+    for (const auto& hit : approx) {
+        for (const auto& t : truth) {
+            if (t.id != hit.id) {
+                continue;
+            }
+            // Relative agreement within PQ quantization noise; both must be L2-scale.
+            CHECK(hit.score > 0.f || t.score < 1e-3f);
+            if (t.score > 0.1f) {
+                const float ratio = hit.score / t.score;
+                CHECK(ratio > 0.3f && ratio < 3.f);
+                // Squared would be ~t.score times larger than true L2 for distances >> 1.
+                CHECK(std::fabs(hit.score - t.score * t.score) >
+                      std::fabs(hit.score - t.score) * 0.5f || t.score < 1.2f);
+            }
+        }
+    }
+}
+
 void test_ivfpq_remove_update() {
     tinyann::IvfPqParams p;
     p.nlist = 4;
@@ -2204,6 +2278,7 @@ int main() {
     test_ivfpq_refine_improves_recall();
     test_ivfpq_opq_basic_and_save_load();
     test_ivfpq_opq_better_than_pq();
+    test_ivfpq_euclidean_scores_are_l2_not_squared();
     test_ivfpq_remove_update();
     test_sq_quantize_dequantize();
     test_index_sq_search_and_recall();
