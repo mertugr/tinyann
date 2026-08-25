@@ -34,3 +34,17 @@ jobs:
             --index exact --save /tmp/exact.tann
           ./build/tinyann --load /tmp/exact.tann --index exact \
             --query data/query.txt --k 3
+
+  python:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: Install toolchain
+        run: sudo apt-get update && sudo apt-get install -y cmake g++
+      - name: Install package
+        run: pip install ".[test]"
+      - name: Binding tests
+        run: pytest tests/test_python.py -q
