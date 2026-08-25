@@ -131,6 +131,25 @@ auto loaded = tinyann::IvfPqIndex::load("corpus.ivfpq.tann");
 
 Header-only: link the `tinyann` CMake interface target (or add `include/`).
 
+## Python (exact cosine only)
+
+```bash
+pip install -e ".[test]"
+pytest tests/test_python.py
+```
+
+```python
+import tinyann
+
+index = tinyann.Index(32, "cosine")
+index.add(1, vector)
+hits = index.search(query, k=10)                 # [(id, score), ...]
+hits = index.search(query, k=10, allow_ids=[1])  # filtered
+index.remove(1)
+```
+
+The wheel exposes **exact** `Index` only: `add`, `search`, `remove`, cosine. HNSW / IVF / SQ stay C++/CLI. Duplicate ids raise. NaN/Inf and a wrong dimension raise instead of corrupting the index.
+
 ## CLI
 
 ```bash

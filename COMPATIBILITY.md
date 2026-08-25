@@ -12,6 +12,7 @@ nanollm 0.4.x  ──►  nanorag 0.1.x
 | Consumer | Package requirement | Role |
 |----------|---------------------|------|
 | **nanorag** | `find_package(tinyann 0.1)` / submodule | Dense ANN (HNSW + cosine) for retrieval |
+| **kasaba** | `pip` / `uv` package `tinyann` | Exact cosine `Index` (`add` / `search` / `remove`) as a MemoryStore backend |
 | Standalone | — | CLI + CTest |
 
 ## Formats
